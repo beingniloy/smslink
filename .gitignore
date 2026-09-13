@@ -1,0 +1,18 @@
+# Configuration and environment locks
+config/installed.lock
+config/db_credentials.php
+config/settings.json
+
+# User Uploads
+dashboard/uploads/avatars/*
+!dashboard/uploads/avatars/.gitkeep
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Temporary & Build Zip files
+*.tmp
+smslink_production_temp.zip
