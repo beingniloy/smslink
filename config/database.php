@@ -231,11 +231,16 @@ function getSystemSettings($pdo) {
     static $settings = null;
     if ($settings !== null) return $settings;
 
+    $apkVer = defined('APP_APK_VERSION') ? APP_APK_VERSION : 'v1.0.0';
+    $apkUrl = defined('APP_APK_URL') ? APP_APK_URL : 'https://github.com/beingniloy/smslink/releases/download/' . $apkVer . '/SMSLink-' . $apkVer . '.apk';
+
     $defaults = [
         'app_name' => 'SMSLink',
         'app_url' => getAutoDetectedBaseUrl(),
         'theme_color' => '#057d77',
-        'theme_color_hover' => '#04635e'
+        'theme_color_hover' => '#04635e',
+        'app_apk_version' => $apkVer,
+        'app_apk_url' => $apkUrl
     ];
 
     try {
@@ -245,6 +250,9 @@ function getSystemSettings($pdo) {
             $settings = array_merge($defaults, array_filter($rows));
             if (empty($settings['app_url'])) {
                 $settings['app_url'] = getAutoDetectedBaseUrl();
+            }
+            if (empty($settings['app_apk_url'])) {
+                $settings['app_apk_url'] = $apkUrl;
             }
             return $settings;
         }

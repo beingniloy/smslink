@@ -216,9 +216,32 @@ function renderSentMessagesTableRows($sentMessages) {
     return ob_get_clean();
 }
 
-if ($isAuthed && isset($_GET['action'])) {
+if (isset($_GET['action'])) {
     header('Content-Type: application/json');
+    if (!$isAuthed) {
+        echo json_encode(['ok' => false, 'authed' => false, 'error' => 'Session expired. Please sign in again.']);
+        exit;
+    }
     $action = $_GET['action'];
+
+    if ($action === 'check_session') {
+        echo json_encode([
+            'ok' => true,
+            'authed' => true,
+            'user_id' => $_SESSION['tf_user_id'] ?? null,
+            'username' => $_SESSION['tf_username'] ?? null,
+            'role' => $_SESSION['tf_role'] ?? 'admin'
+        ]);
+        exit;
+    }
+
+    if ($action === 'get_devices_json') {
+        $stmtDevs = $pdo->query("SELECT id, device_id, device_name, model, android_version, status, last_seen, sms_sent_count FROM devices ORDER BY id DESC");
+        $devices = $stmtDevs->fetchAll(PDO::FETCH_ASSOC);
+        $onlineCount = count(array_filter($devices, fn($d) => !empty($d['status']) && $d['status'] === 'online' && !empty($d['last_seen']) && abs(time() - strtotime($d['last_seen'])) < 45));
+        echo json_encode(['ok' => true, 'devices' => $devices, 'online_count' => $onlineCount]);
+        exit;
+    }
 
     if ($action === 'get_sent_messages_html') {
         $stmtSentMessages = $pdo->query("SELECT id, message_id, recipient AS `to`, message_body AS message, sim_slot, status, assigned_device_id AS assigned_device, created_at, sent_at, error_message AS error FROM sms_messages ORDER BY id DESC LIMIT 200");
@@ -489,6 +512,8 @@ if ($isAuthed && isset($_GET['action'])) {
         $appUrl  = trim($_POST['app_url'] ?? getAutoDetectedBaseUrl());
         $themeColor = trim($_POST['theme_color'] ?? '#057d77');
         $themeHover = trim($_POST['theme_color_hover'] ?? '#04635e');
+        $apkUrl = trim($_POST['app_apk_url'] ?? '');
+        $apkVer = trim($_POST['app_apk_version'] ?? '');
 
         $appUrl = rtrim($appUrl, '/');
 
@@ -497,6 +522,12 @@ if ($isAuthed && isset($_GET['action'])) {
         $stmtSave->execute(['app_url', $appUrl]);
         $stmtSave->execute(['theme_color', $themeColor]);
         $stmtSave->execute(['theme_color_hover', $themeHover]);
+        if (!empty($apkUrl)) {
+            $stmtSave->execute(['app_apk_url', $apkUrl]);
+        }
+        if (!empty($apkVer)) {
+            $stmtSave->execute(['app_apk_version', $apkVer]);
+        }
 
         logActivity('settings_update', 'Admin updated system settings (Base URL: ' . $appUrl . ')');
         echo json_encode(['ok' => true, 'message' => 'Settings updated successfully!']);
@@ -631,31 +662,52 @@ if ($isAuthed && isset($_GET['action'])) {
         $changelog = null;
         $htmlUrl = "https://github.com/{$repo}/releases";
 
-        $opts = [
-            'http' => [
-                'method' => 'GET',
-                'header' => "User-Agent: SMSLink-Updater\r\nAccept: application/vnd.github.v3+json\r\n",
-                'timeout' => 8
-            ]
-        ];
-        $ctx = stream_context_create($opts);
+        $fetchGithubUrl = function($url) {
+            if (function_exists('curl_init')) {
+                $ch = curl_init();
+                curl_setopt($ch, CURLOPT_URL, $url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_USERAGENT, 'SMSLink-Updater');
+                curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/vnd.github.v3+json']);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+                $res = curl_exec($ch);
+                curl_close($ch);
+                if (!empty($res)) return $res;
+            }
+            $opts = [
+                'http' => [
+                    'method' => 'GET',
+                    'header' => "User-Agent: SMSLink-Updater\r\nAccept: application/vnd.github.v3+json\r\n",
+                    'timeout' => 8
+                ],
+                'ssl' => [
+                    'verify_peer' => false,
+                    'verify_peer_name' => false
+                ]
+            ];
+            $ctx = stream_context_create($opts);
+            return @file_get_contents($url, false, $ctx);
+        };
 
-        
-        $json = @file_get_contents("https://api.github.com/repos/{$repo}/releases/latest", false, $ctx);
+        // 1. Try fetching latest official release from GitHub API
+        $json = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
         if ($json) {
             $data = json_decode($json, true);
             if (!empty($data['tag_name'])) {
                 $latestTag = $data['tag_name'];
                 $releaseName = $data['name'] ?? $latestTag;
                 $publishedAt = isset($data['published_at']) ? date('M d, Y', strtotime($data['published_at'])) : date('M d, Y');
-                $changelog = $data['body'] ?? 'No changelog details provided.';
+                $changelog = !empty($data['body']) ? $data['body'] : 'No changelog details provided.';
                 $htmlUrl = $data['html_url'] ?? $htmlUrl;
             }
         }
 
-        
+        // 2. Fallback to repository tags if releases array is empty
         if (!$latestTag) {
-            $tagsJson = @file_get_contents("https://api.github.com/repos/{$repo}/tags", false, $ctx);
+            $tagsJson = $fetchGithubUrl("https://api.github.com/repos/{$repo}/tags");
             if ($tagsJson) {
                 $tagsData = json_decode($tagsJson, true);
                 if (!empty($tagsData) && isset($tagsData[0]['name'])) {
@@ -670,7 +722,7 @@ if ($isAuthed && isset($_GET['action'])) {
 
         if (!$latestTag) {
             $latestTag = $currentVersion;
-            $releaseName = "SMSLink Official Stable Release";
+            $releaseName = "SMSLink Official Release " . $currentVersion;
             $publishedAt = defined('APP_BUILD_DATE') ? date('M d, Y', strtotime(APP_BUILD_DATE)) : date('M d, Y');
             $changelog = "You are running the current verified stable release of SMSLink.";
         }
@@ -805,6 +857,8 @@ $baseUrl = !empty($sysSettings['app_url']) ? $sysSettings['app_url'] : getAutoDe
 $appUrl = $baseUrl;
 $themeColor = !empty($sysSettings['theme_color']) ? $sysSettings['theme_color'] : '#057d77';
 $themeHover = !empty($sysSettings['theme_color_hover']) ? $sysSettings['theme_color_hover'] : '#04635e';
+$appApkUrl = !empty($sysSettings['app_apk_url']) ? $sysSettings['app_apk_url'] : (defined('APP_APK_URL') ? APP_APK_URL : 'https://github.com/beingniloy/smslink/releases/download/v1.0.0/SMSLink-v1.0.0.apk');
+$appApkVersion = !empty($sysSettings['app_apk_version']) ? $sysSettings['app_apk_version'] : (defined('APP_APK_VERSION') ? APP_APK_VERSION : 'v1.0.0');
 $secTitles = [
     'status' => 'Dashboard',
     'send' => 'Send SMS',
@@ -820,7 +874,11 @@ $secTitles = [
 ];
 $reqPath = trim(parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '', '/');
 $pathParts = explode('/', $reqPath);
-$currentSec = end($pathParts);
+$currentSec = strtolower(end($pathParts));
+if (!isset($secTitles[$currentSec])) {
+    $currentSec = 'status';
+}
+$initialSecTitle = $secTitles[$currentSec];
 $scriptDir = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/dashboard/index.php'), '/\\');
 $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim($scriptDir, '/') . '/dashboard';
 ?>
@@ -829,6 +887,7 @@ $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<base href="<?php echo htmlspecialchars($dashBaseUrl); ?>/">
 <title><?php echo htmlspecialchars($appName . ' - ' . $initialSecTitle); ?></title>
 <link rel="icon" type="image/png" href="https://cdn.niloy.io/projects/smslink/favicon.png">
 <link rel="shortcut icon" type="image/png" href="https://cdn.niloy.io/projects/smslink/favicon.png">
@@ -855,7 +914,7 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   text-align: center;
   background: #f0fdf4;
   border: 1px solid #bbf7d0;
-  border-radius: 16px;
+  border-radius: 6px;
   width: 100%;
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.08);
 }
@@ -918,7 +977,7 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   background: #ffffff;
   border: 1px solid #a7f3d0;
   padding: 5px 14px;
-  border-radius: 20px;
+  border-radius: 6px;
   box-shadow: 0 1px 2px rgba(0,0,0,0.03);
 }
 .qr-pulse-dot {
@@ -944,9 +1003,146 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   animation: spin 0.8s linear infinite;
 }
 
+/* Modern Toast Notification System */
+#toastContainer {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 99999;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+  max-width: 380px;
+  width: calc(100% - 40px);
+}
+.toast-item {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--app-border-color);
+  box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.15), 0 4px 6px -2px rgba(15, 23, 42, 0.05);
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  opacity: 0;
+  transform: translateX(40px) scale(0.95);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.toast-item.toast-show {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+}
+.toast-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+.toast-success { border-left: 4px solid #10b981; }
+.toast-success .toast-icon { background: #dcfce7; color: #10b981; }
+.toast-error { border-left: 4px solid #ef4444; }
+.toast-error .toast-icon { background: #fee2e2; color: #ef4444; }
+.toast-warning { border-left: 4px solid #f59e0b; }
+.toast-warning .toast-icon { background: #fef3c7; color: #d97706; }
+.toast-info { border-left: 4px solid #0284c7; }
+.toast-info .toast-icon { background: #e0f2fe; color: #0284c7; }
+.toast-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.toast-close:hover { color: #0f172a; background: #f1f5f9; }
+
+/* Button Loaders & States */
+.app-btn:disabled, .app-btn.btn-loading {
+  opacity: 0.75 !important;
+  cursor: not-allowed !important;
+  pointer-events: none !important;
+  box-shadow: none !important;
+}
+.btn-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* SIM Selection Radio Pill Group */
+.sim-radio-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-top: 4px;
+}
+.sim-radio-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: #FFF;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+.sim-radio-card:hover {
+  border-color: var(--primary);
+  background: #f8fafc;
+}
+.sim-radio-card.active {
+  border-color: var(--primary);
+  background: var(--primary-light);
+  box-shadow: 0 0 0 2px rgba(5, 125, 119, 0.2);
+}
+.sim-radio-card input[type="radio"] {
+  accent-color: var(--primary);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+.sim-radio-info strong {
+  display: block;
+  font-size: 13px;
+  color: #0f172a;
+  font-weight: 600;
+}
+.sim-radio-info small {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.country-option-item:hover {
+  background: #f1f5f9 !important;
+}
+
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:9999px}
+::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#94a3b8}
 *{scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent}
 
@@ -956,26 +1152,44 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
 
 .app-brand{display:flex;align-items:baseline;gap:6px;font-size:18px;font-weight:700;color:#0f172a;letter-spacing:-0.03em;text-decoration:none}
 .app-brand span{color:var(--primary);font-weight:400}
-.app-brand-ver{font-size:10px;font-family:'Fira Code',monospace;background:var(--primary-tint);color:var(--primary);padding:2px 6px;border-radius:4px;font-weight:500}
+.app-brand-ver{font-size:10px;font-family:'Fira Code',monospace;background:var(--primary-tint);color:var(--primary);padding:2px 6px;border-radius:6px;font-weight:500}
 
 .app-sidebar-nav{flex:1;padding:16px 12px;overflow-y:auto;display:flex;flex-direction:column;gap:20px}
 .app-nav-group-title{font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.08em;padding:0 12px 8px;opacity:0.8}
 .app-nav-items{display:flex;flex-direction:column;gap:2px}
-.app-nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;color:#475569;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;text-decoration:none}
+.app-nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:6px;color:#475569;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;text-decoration:none}
 .app-nav-item:hover{background:#f1f5f9;color:#0f172a}
 .app-nav-item.active{background:var(--primary-light);color:var(--primary);font-weight:600}
 .app-nav-item svg{width:18px;height:18px;flex-shrink:0;color:currentColor}
 
 .app-sidebar-footer{padding:16px;border-top:1px solid var(--app-border-color);display:flex;align-items:center;justify-content:space-between}
-.app-user-avatar{width:32px;height:32px;border-radius:50%;background:var(--primary);color:#ffffff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px}
+.app-user-avatar{width:32px;height:32px;border-radius:50%;background:var(--primary);color:#ffffff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;flex-shrink:0}
+.app-user-avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%}
 
 .app-main-wrapper{flex:1;height:100vh;margin-left:260px;display:flex;flex-direction:column;overflow:hidden;min-width:0}
 .app-topbar{height:64px;flex-shrink:0;background:#FFF;border-bottom:1px solid var(--app-border-color);display:flex;align-items:center;justify-content:space-between;padding:0 28px;z-index:30}
 .app-page-title{font-size:20px;font-weight:700;color:#0f172a;letter-spacing:-0.02em}
 
+.app-topbar-left{display:flex;align-items:center;gap:10px;min-width:0}
+.app-topbar-right{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end;min-width:0}
+.app-topbar-search-toggle{display:none}
+.app-topbar-search-back{display:none}
+.app-topbar-search-wrap{position:relative;width:100%;max-width:380px}
+.app-topbar-search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#94a3b8;display:flex;align-items:center;pointer-events:none}
+.app-topbar-search-wrap input{padding-left:34px;padding-right:10px;height:36px;font-size:13px;border-radius:10px;background:#f8fafc;border:1px solid #cbd5e1;width:100%;outline:none;transition:all 0.15s}
+.app-topbar-search-wrap input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(5,125,119,0.15)}
+.app-topbar-search-results{position:absolute;top:42px;left:0;right:0;background:#FFF;border:1px solid var(--app-border-color);border-radius:12px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.1);max-height:360px;overflow-y:auto;z-index:100;padding:8px}
+.app-topbar-actions{display:flex;align-items:center;gap:10px;flex-shrink:0}
+
+.app-topbar-apk-btn{background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;font-size:12.5px;padding:0 12px;height:36px;border-radius:6px;display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:600;flex-shrink:0;transition:all 0.15s}
+.app-topbar-sponsor-btn{background:#fdf2f8;color:#db2777;border:1px solid #fbcfe8;font-size:12.5px;padding:0 12px;height:36px;border-radius:9999px!important;display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:600;flex-shrink:0;transition:all 0.15s}
+.app-topbar-user-btn{display:inline-flex;align-items:center;gap:8px;text-decoration:none;cursor:pointer;padding:0 12px 0 4px;height:36px;border-radius:9999px;background:#f1f5f9;border:1px solid var(--app-border-color);transition:all 0.15s;flex-shrink:0}
+.app-topbar-user-btn:hover{background:#e2e8f0}
+.app-topbar-user-name{font-size:13px;font-weight:600;color:#334155}
+
 .app-content-scroll{flex:1;overflow-y:auto;overflow-x:hidden;width:100%}
 
-.app-status-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:9999px;font-size:12px;font-weight:600;background:var(--primary-light);color:var(--primary);border:1px solid rgba(5,125,119,0.25)}
+.app-status-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;background:var(--primary-light);color:var(--primary);border:1px solid rgba(5,125,119,0.25)}
 .app-status-badge.offline{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
 .app-pulse-dot{width:8px;height:8px;border-radius:50%;background:var(--primary);box-shadow:0 0 0 0 rgba(5,125,119,0.7);animation:pulse 2s infinite}
 .app-status-badge.offline .app-pulse-dot{background:#ef4444;box-shadow:none;animation:none}
@@ -984,36 +1198,36 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
 .app-content{padding:28px;max-width:1400px;width:100%;margin:0 auto}
 
 .app-widget-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;margin-bottom:24px}
-.app-card{background:#FFF;border:1px solid var(--app-border-color);border-radius:16px;box-shadow:0 1px 3px 0 rgba(15,23,42,0.03);padding:24px;margin-bottom:24px}
+.app-card{background:#FFF;border:1px solid var(--app-border-color);border-radius:6px;box-shadow:0 1px 3px 0 rgba(15,23,42,0.03);padding:24px;margin-bottom:24px}
 .app-card-header{margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
 .app-card-title{font-size:16px;font-weight:700;color:#0f172a}
 .app-card-sub{font-size:13px;color:#64748b;margin-top:2px}
 
-.app-stat-card{background:#FFF;border:1px solid var(--app-border-color);border-radius:16px;padding:20px;box-shadow:0 1px 3px 0 rgba(15,23,42,0.03)}
+.app-stat-card{background:#FFF;border:1px solid var(--app-border-color);border-radius:6px;padding:20px;box-shadow:0 1px 3px 0 rgba(15,23,42,0.03)}
 .app-stat-label{font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.04em}
 .app-stat-val{font-size:30px;font-weight:800;color:#0f172a;margin-top:6px;letter-spacing:-0.03em}
 .app-stat-sub{font-size:12px;color:var(--primary);font-weight:600;margin-top:4px;display:flex;align-items:center;gap:4px}
 
 .app-form-group{margin-bottom:18px}
 .app-label{display:block;font-size:12px;font-weight:600;color:#334155;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px}
-.app-input,.app-select,.app-textarea{width:100%;padding:10px 14px;background:#FFF;border:1px solid #cbd5e1;border-radius:10px;color:#0f172a;font-size:14px;outline:none;transition:all 0.15s}
+.app-input,.app-select,.app-textarea{width:100%;padding:10px 14px;background:#FFF;border:1px solid #cbd5e1;border-radius:6px;color:#0f172a;font-size:14px;outline:none;transition:all 0.15s}
 .app-input:focus,.app-select:focus,.app-textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(5,125,119,0.18)}
 .app-textarea{min-height:100px;resize:vertical}
 .app-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
 
-.app-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:600;font-size:13px;padding:10px 18px;border-radius:10px;border:none;cursor:pointer;transition:all 0.15s;text-decoration:none}
+.app-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:600;font-size:13px;padding:10px 18px;border-radius:6px;border:none;cursor:pointer;transition:all 0.15s;text-decoration:none}
 .app-btn-primary{background:var(--primary);color:#FFF;box-shadow:0 1px 2px rgba(5,125,119,0.25)}.app-btn-primary:hover{background:var(--primary-hover)}
 .app-btn-secondary{background:#FFF;border:1px solid #cbd5e1;color:#334155}.app-btn-secondary:hover{background:#f8fafc}
 .app-btn-danger{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}.app-btn-danger:hover{background:#fee2e2}
 
-.app-table-wrap{border:1px solid var(--app-border-color);border-radius:12px;overflow:hidden;background:#FFF}
+.app-table-wrap{border:1px solid var(--app-border-color);border-radius:6px;overflow:hidden;background:#FFF}
 .app-table{width:100%;border-collapse:collapse;font-size:13px;text-align:left}
 .app-table th{background:#f8fafc;padding:12px 16px;font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid var(--app-border-color)}
 .app-table td{padding:14px 16px;border-bottom:1px solid #f1f5f9;color:#334155}
 .app-table tr:last-child td{border-bottom:none}
 .app-table tr:hover td{background:#f8fafc}
 
-.app-badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:9999px;font-size:11px;font-weight:600;font-family:'Fira Code',monospace}
+.app-badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600;font-family:'Fira Code',monospace}
 .app-badge-green{background:var(--primary-light);color:var(--primary);border:1px solid rgba(5,125,119,0.3)}
 .app-badge-amber{background:#fffbeb;color:#b45309;border:1px solid #fde68a}
 .app-badge-rose{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
@@ -1023,14 +1237,14 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
 .section{display:none}.section.active{display:block}
 
 .app-login-bg{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f8fafc;padding:20px}
-.app-login-card{width:100%;max-width:400px;background:#FFF;border-radius:20px;padding:32px;box-shadow:0 25px 50px -12px rgba(15,23,42,0.12);border:1px solid var(--app-border-color)}
+.app-login-card{width:100%;max-width:400px;background:#FFF;border-radius:6px;padding:32px;box-shadow:0 25px 50px -12px rgba(15,23,42,0.12);border:1px solid var(--app-border-color)}
 
 .app-modal-bg{position:fixed;inset:0;background:rgba(15,23,42,0.65);backdrop-filter:blur(4px);z-index:999;display:none;align-items:center;justify-content:center;padding:20px}
-.app-modal-card{background:#FFF;border-radius:20px;width:100%;max-width:440px;padding:28px;text-align:center;box-shadow:0 25px 50px -12px rgba(0,0,0,0.25);border:1px solid var(--app-border-color)}
+.app-modal-card{background:#FFF;border-radius:6px;width:100%;max-width:440px;padding:28px;text-align:center;box-shadow:0 25px 50px -12px rgba(0,0,0,0.25);border:1px solid var(--app-border-color)}
 
-.app-mobile-toggle{display:none;background:none;border:1px solid var(--app-border-color);padding:6px 10px;border-radius:8px;font-size:18px;cursor:pointer;color:#334155;line-height:1}
+.app-mobile-toggle{display:none;background:none;border:1px solid var(--app-border-color);padding:6px 10px;border-radius:6px;font-size:18px;cursor:pointer;color:#334155;line-height:1}
 .app-sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(15,23,42,0.6);backdrop-filter:blur(3px);z-index:39}
-.app-user-profile-btn{display:flex;align-items:center;gap:10px;text-decoration:none;cursor:pointer;padding:6px 8px;border-radius:8px;transition:background 0.15s;flex:1}
+.app-user-profile-btn{display:flex;align-items:center;gap:10px;text-decoration:none;cursor:pointer;padding:6px 8px;border-radius:6px;transition:background 0.15s;flex:1}
 .app-user-profile-btn:hover{background:#f1f5f9}
 
 @media(max-width:1024px){
@@ -1043,30 +1257,57 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   .app-sidebar.mobile-open{transform:translateX(0)}
   .app-sidebar-overlay.mobile-open{display:block}
   .app-main-wrapper{margin-left:0}
-  .app-topbar{padding:0 12px;height:56px;gap:8px}
-  .app-page-title{font-size:15px;max-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .app-topbar-search-wrap{max-width:160px;transition:max-width 0.2s ease}
-  .app-topbar-search-wrap:focus-within{max-width:240px}
-  .app-topbar-search-wrap input{font-size:12px;padding-left:30px;height:34px}
+  .app-topbar{padding:0 12px;height:56px;gap:6px;position:relative}
+  .app-page-title{font-size:15px;max-width:130px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .app-topbar-right{gap:6px}
+
+  /* Compact Search Trigger Button on mobile */
+  .app-topbar-search-toggle{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#f8fafc;border:1px solid #cbd5e1;color:#475569;cursor:pointer;flex-shrink:0;transition:all 0.15s}
+  .app-topbar-search-toggle:hover{background:#f1f5f9;color:var(--primary)}
+
+  /* Hide Search Input Wrap by default on mobile */
+  .app-topbar-search-wrap{display:none}
+
+  /* Mobile Compact Action Buttons with centered icons */
+  .app-topbar-apk-btn{width:36px;height:36px;padding:0;border-radius:6px;justify-content:center;align-items:center}
+  .app-topbar-apk-btn span{display:none}
+  .app-topbar-apk-btn svg{width:18px!important;height:18px!important;flex-shrink:0}
+
+  .app-topbar-sponsor-btn{width:36px;height:36px;padding:0;border-radius:50%!important;justify-content:center;align-items:center}
   .app-topbar-sponsor-btn span{display:none}
-  .app-topbar-sponsor-btn{padding:7px;border-radius:50%}
+  .app-topbar-sponsor-btn svg{width:18px!important;height:18px!important;flex-shrink:0}
+
+  /* Profile Avatar Button on mobile: 36px circular wrapper with centered avatar image */
+  .app-topbar-user-btn{width:36px;height:36px;padding:0;border-radius:50%;justify-content:center;background:none;border:none}
   .app-topbar-user-name{display:none}
-  .app-topbar-user-btn{padding:3px;background:none;border:none}
+  .app-user-avatar{width:34px;height:34px;margin:0 auto;display:flex;align-items:center;justify-content:center;border-radius:50%;overflow:hidden}
+
+  /* Mobile Search Active Mode */
+  .app-topbar.search-active .app-topbar-left{display:none!important}
+  .app-topbar.search-active .app-topbar-actions{display:none!important}
+  .app-topbar.search-active .app-topbar-search-toggle{display:none!important}
+
+  .app-topbar.search-active .app-topbar-right{flex:1;width:100%}
+  .app-topbar.search-active .app-topbar-search-wrap{display:flex;align-items:center;width:100%;max-width:100%;gap:6px;position:relative}
+  .app-topbar.search-active .app-topbar-search-back{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;background:none;border:none;color:#475569;cursor:pointer;flex-shrink:0;border-radius:50%}
+  .app-topbar.search-active .app-topbar-search-back:hover{background:#f1f5f9;color:#0f172a}
+  .app-topbar.search-active .app-topbar-search-icon{left:46px}
+  .app-topbar.search-active .app-topbar-search-wrap input{padding-left:36px;height:38px;border-color:var(--primary);background:#FFF;font-size:13px;width:100%}
+
   .app-content{padding:16px}
-  .app-card{padding:16px;border-radius:14px;margin-bottom:16px}
+  .app-card{padding:16px;border-radius:6px;margin-bottom:16px}
   .app-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .app-table{min-width:640px}
-  .app-modal-card{padding:20px;border-radius:16px}
+  .app-modal-card{padding:20px;border-radius:6px}
   .app-btn{padding:8px 14px;font-size:12px}
 }
 @media(max-width:480px){
-  .app-page-title{font-size:14px;max-width:90px}
-  .app-topbar-search-wrap{max-width:110px}
-  .app-topbar-search-wrap:focus-within{max-width:180px}
+  .app-page-title{font-size:14px;max-width:100px}
 }
 </style>
 </head>
 <body>
+<div id="toastContainer"></div>
 
 <?php if (!$isAuthed): ?>
 <div class="app-login-bg">
@@ -1116,7 +1357,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
     <div class="app-content-scroll">
       <div class="app-content">
       
-      <div class="section active" id="section-status">
+      <div class="section <?php echo (($currentSec ?? 'status') === 'status') ? 'active' : ''; ?>" id="section-status">
         <div class="app-widget-grid">
           <div class="app-stat-card">
             <div class="app-stat-label">Total Sent SMS</div>
@@ -1195,49 +1436,105 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-send">
+      <div class="section <?php echo (($currentSec ?? '') === 'send') ? 'active' : ''; ?>" id="section-send">
         <div class="app-card">
           <div class="app-card-header">
             <div>
-              <div class="app-card-title">Instant Compose & Send SMS</div>
+              <div class="app-card-title">Instant Compose &amp; Send SMS</div>
               <div class="app-card-sub">High-speed instant SMS dispatch via MySQL engine</div>
             </div>
           </div>
 
           <div class="app-form-group">
-            <label class="app-label">Recipient Phone Numbers (comma-separated)</label>
-            <input type="text" id="sendNumbers" class="app-input" placeholder="017XXXXXXXX, 018XXXXXXXX">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+              <label class="app-label" id="phoneInputLabel" style="margin-bottom:0">Recipient Phone Number</label>
+              <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--primary);cursor:pointer;user-select:none">
+                <input type="checkbox" id="bulkModeToggle" style="accent-color:var(--primary);cursor:pointer" onchange="toggleBulkMode(this.checked)">
+                <span>Enable Bulk Mode (Multiple numbers)</span>
+              </label>
+            </div>
+            
+            <div style="position:relative;width:100%" id="googlePhoneWrap">
+              <div style="display:flex;align-items:center;border:1px solid #cbd5e1;border-radius:6px;background:#fff;transition:all 0.15s" id="googlePhoneInputBox">
+                <div class="country-picker-trigger" onclick="toggleCountryPicker(event)" style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f8fafc;border-right:1px solid #cbd5e1;border-top-left-radius:5px;border-bottom-left-radius:5px;cursor:pointer;user-select:none;flex-shrink:0">
+                  <img id="selectedFlagImg" src="https://flagcdn.com/w40/bd.png" alt="BD" style="width:20px;height:14px;object-fit:cover;border-radius:2px;box-shadow:0 0 1px rgba(0,0,0,0.4)">
+                  <span id="selectedDialCode" style="font-size:13.5px;font-weight:700;color:#0f172a">+880</span>
+                  <svg style="width:12px;height:12px;color:#64748b" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path d="M19 9l-7 7-7-7"/></svg>
+                </div>
+                <input type="hidden" id="countryCodeSelect" value="+880">
+                <input type="text" id="sendNumbers" class="app-input" style="flex:1;border:none;border-radius:0 5px 5px 0;box-shadow:none;padding:10px 14px;background:transparent" placeholder="" oninput="onPhoneInputChanged()" onfocus="document.getElementById('googlePhoneInputBox').style.borderColor='var(--primary)';document.getElementById('googlePhoneInputBox').style.boxShadow='0 0 0 3px rgba(5,125,119,0.18)'" onblur="document.getElementById('googlePhoneInputBox').style.borderColor='#cbd5e1';document.getElementById('googlePhoneInputBox').style.boxShadow='none'">
+              </div>
+
+              <!-- Google-Style Country Picker Dropdown -->
+              <div id="countryPickerDropdown" style="display:none;position:absolute;top:calc(100% + 4px);left:0;z-index:9999;width:320px;background:#ffffff;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 12px 28px -4px rgba(15,23,42,0.18);overflow:hidden">
+                <div style="padding:10px;border-bottom:1px solid #f1f5f9;background:#f8fafc">
+                  <div style="position:relative">
+                    <svg style="position:absolute;left:10px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:#94a3b8" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                    <input type="text" id="countrySearchBox" placeholder="Search country or code..." style="width:100%;padding:7px 10px 7px 32px;font-size:12.5px;border:1px solid #cbd5e1;border-radius:6px;outline:none" oninput="filterCountryOptions(this.value)">
+                  </div>
+                </div>
+                <div id="countryOptionsList" style="max-height:220px;overflow-y:auto;padding:4px 0"></div>
+              </div>
+            </div>
+            
+            <div id="phoneValidationStatus" style="font-size:12px;margin-top:5px;font-weight:500;min-height:18px;display:flex;align-items:center;gap:6px;color:#64748b">
+              Enter phone number (e.g. 017XXXXXXXX)
+            </div>
           </div>
 
           <div class="app-form-group">
-            <label class="app-label">SMS Message</label>
-            <textarea id="sendMessage" class="app-textarea" placeholder="Enter message body..."></textarea>
-          </div>
-
-          <div class="app-form-grid">
-            <div class="app-form-group">
-              <label class="app-label">Target Android Device</label>
-              <select id="sendDevice" class="app-select">
-                <option value="auto">Auto (Best Available Online Phone)</option>
-                <?php foreach ($devices as $dev): ?>
-                <option value="<?php echo htmlspecialchars($dev['device_id']); ?>">
-                  <?php echo htmlspecialchars(($dev['device_name']??$dev['model']).' ('.$dev['device_id'].')'); ?>
-                </option>
-                <?php endforeach; ?>
-              </select>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+              <label class="app-label" style="margin-bottom:0">SMS Message Content</label>
+              <span style="font-size:12px;color:#64748b"><strong id="msgCharCount" style="color:#0f172a">0</strong> / 160 characters (1 SMS segment)</span>
             </div>
-
-            <div class="app-form-group">
-              <label class="app-label">Dual-SIM Selection</label>
-              <select id="sendSimSlot" class="app-select">
-                <option value="0">Auto (Default System SIM)</option>
-                <option value="1">SIM 1</option>
-                <option value="2">SIM 2</option>
-              </select>
+            <textarea id="sendMessage" class="app-textarea" maxlength="160" placeholder="Type your SMS message here..." oninput="updateSmsCharCount()"></textarea>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;font-size:11px;color:#64748b">
+              <span>Standard 1-segment GSM limit: 160 characters</span>
+              <span id="charLimitWarning" style="color:#ef4444;font-weight:600;display:none">● Maximum 160 characters limit reached</span>
             </div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
+          <div class="app-form-group">
+            <label class="app-label">Target Android Device</label>
+            <select id="sendDevice" class="app-select">
+              <option value="auto">Auto</option>
+              <?php foreach ($devices as $dev): ?>
+              <option value="<?php echo htmlspecialchars($dev['device_id']); ?>">
+                <?php echo htmlspecialchars($dev['device_name'] ?: $dev['model']); ?>
+              </option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+
+          <div class="app-form-group">
+            <label class="app-label">Dual-SIM Selection</label>
+            <input type="hidden" id="sendSimSlot" value="0">
+            <div class="sim-radio-group">
+              <label class="sim-radio-card active" onclick="selectSimRadio(0, this)">
+                <input type="radio" name="sim_slot_radio" value="0" checked>
+                <div class="sim-radio-info">
+                  <strong>Auto SIM</strong>
+                  <small>Default system SIM</small>
+                </div>
+              </label>
+              <label class="sim-radio-card" onclick="selectSimRadio(1, this)">
+                <input type="radio" name="sim_slot_radio" value="1">
+                <div class="sim-radio-info">
+                  <strong>SIM 1</strong>
+                  <small>Force Slot 1</small>
+                </div>
+              </label>
+              <label class="sim-radio-card" onclick="selectSimRadio(2, this)">
+                <input type="radio" name="sim_slot_radio" value="2">
+                <div class="sim-radio-info">
+                  <strong>SIM 2</strong>
+                  <small>Force Slot 2</small>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
             <button class="app-btn app-btn-primary" onclick="doSend()">Send SMS Now (Instant)</button>
             <span id="sendStatus" style="font-size:13px;font-weight:600"></span>
           </div>
@@ -1245,7 +1542,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-sent">
+      <div class="section <?php echo (($currentSec ?? '') === 'sent') ? 'active' : ''; ?>" id="section-sent">
         <div class="app-card">
           <div class="app-card-header">
             <div>
@@ -1336,7 +1633,29 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-devices">
+      <div class="section <?php echo (($currentSec ?? '') === 'devices') ? 'active' : ''; ?>" id="section-devices">
+        <!-- Gateway Android App Download Banner -->
+        <div class="app-card" style="background:linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);border:1px solid #bfdbfe;border-radius:6px;margin-bottom:20px;padding:20px">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px">
+            <div style="display:flex;align-items:center;gap:14px">
+              <div style="width:46px;height:46px;border-radius:6px;background:#dbeafe;color:#2563eb;display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                <svg style="width:24px;height:24px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+              </div>
+              <div>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <h3 style="font-size:16px;font-weight:700;color:#0f172a;margin:0">SMSLink Gateway Android App</h3>
+                  <span class="app-badge app-badge-teal" style="border-radius:6px"><?php echo htmlspecialchars($appApkVersion); ?></span>
+                </div>
+                <p style="font-size:13px;color:#475569;margin:2px 0 0">Install the official Android Gateway App on your phone to connect your Dual-SIM device via QR code.</p>
+              </div>
+            </div>
+            <a href="<?php echo htmlspecialchars($appApkUrl); ?>" class="app-btn" style="background:#2563eb;color:#ffffff;padding:10px 18px;border-radius:6px;font-weight:600;display:inline-flex;align-items:center;gap:8px;text-decoration:none" download target="_blank">
+              <svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+              Download Gateway App (.APK)
+            </a>
+          </div>
+        </div>
+
         <div class="app-card">
           <?php echo renderDevicesSectionContent($devices, $simsByDevice); ?>
         </div>
@@ -1344,7 +1663,29 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
 
       
       <!-- API Key Management Section -->
-      <div class="section" id="section-apikeys">
+      <div class="section <?php echo (($currentSec ?? '') === 'apikeys') ? 'active' : ''; ?>" id="section-apikeys">
+        <!-- Base API URL Banner Card -->
+        <div class="app-card" style="margin-bottom:20px;background:linear-gradient(135deg, #f0fdf4 0%, #ffffff 100%);border:1px solid #bbf7d0">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px">
+            <div style="display:flex;align-items:center;gap:12px">
+              <div style="width:42px;height:42px;border-radius:10px;background:#dcfce7;color:#10b981;display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                <svg style="width:22px;height:22px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+              </div>
+              <div>
+                <div style="font-size:12px;font-weight:700;color:#15803d;text-transform:uppercase;letter-spacing:0.04em">System Base API Endpoint</div>
+                <div style="font-size:15px;font-weight:700;color:#0f172a;margin-top:2px" class="mono" id="baseApiUrlDisplay"><?php echo htmlspecialchars($baseUrl); ?>/api/v1</div>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <button type="button" class="app-btn app-btn-primary" style="padding:8px 16px;font-size:12px" onclick="copyText('<?php echo htmlspecialchars($baseUrl); ?>/api/v1', this)">
+                <svg style="width:14px;height:14px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                Copy Base API URL
+              </button>
+              <button type="button" class="app-btn app-btn-secondary" style="padding:8px 14px;font-size:12px" onclick="showSection('docs')">View API Docs ↗</button>
+            </div>
+          </div>
+        </div>
+
         <!-- Top Stats / Overview Grid -->
         <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:16px;margin-bottom:20px">
           <div class="app-card" style="padding:16px 20px;display:flex;align-items:center;gap:14px">
@@ -1496,107 +1837,241 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-docs">
+      <div class="section <?php echo (($currentSec ?? '') === 'docs') ? 'active' : ''; ?>" id="section-docs">
         <div class="app-card">
           <div class="app-card-header" style="flex-wrap:wrap;gap:12px">
             <div>
-              <div class="app-card-title">REST API Overview &amp; Authentication</div>
+              <div class="app-card-title" style="font-size:18px;display:flex;align-items:center;gap:10px">
+                <svg style="width:22px;height:22px;color:var(--primary)" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                Developer REST API Documentation
+              </div>
               <div class="app-card-sub" style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
                 <span>Base API Endpoint:</span>
-                <span class="mono" style="color:var(--primary);font-weight:700;background:var(--primary-light);padding:4px 10px;border-radius:6px;border:1px solid rgba(5,125,119,0.2)"><?php echo htmlspecialchars($appUrl); ?>/api/v1</span>
+                <code class="mono" style="color:var(--primary);font-weight:700;background:var(--primary-light);padding:4px 10px;border-radius:6px;border:1px solid rgba(5,125,119,0.2)"><?php echo htmlspecialchars($appUrl); ?>/api/v1</code>
+                <button type="button" class="app-btn app-btn-secondary" style="padding:2px 8px;font-size:11px" onclick="copyText('<?php echo htmlspecialchars($appUrl); ?>/api/v1', this)">Copy</button>
               </div>
+            </div>
+            <a href="apikeys" onclick="showSection('apikeys'); return false;" class="app-btn app-btn-primary">Manage Secret Keys 🔑</a>
+          </div>
+
+          <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:12px;padding:16px;margin-bottom:24px;display:flex;align-items:center;gap:12px">
+            <svg style="width:20px;height:20px;color:var(--primary);flex-shrink:0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+            <div style="font-size:13px;color:#334155">
+              <strong>Authentication:</strong> All REST API requests require standard HTTP Bearer token authorization in the request header:
+              <code class="mono" style="background:#e2e8f0;padding:2px 6px;border-radius:4px;color:#0f172a;margin-left:4px">Authorization: Bearer &lt;YOUR_API_KEY&gt;</code>
             </div>
           </div>
           
           <div style="display:flex;flex-direction:column;gap:24px">
             
-            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:12px;padding:20px">
+            <!-- 1. Send SMS Endpoint -->
+            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:14px;padding:20px">
               <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-                <span class="app-badge app-badge-green" style="font-size:12px">POST</span>
-                <strong class="mono" style="font-size:14px;color:#0f172a">/api/v1/send</strong>
+                <span class="app-badge app-badge-green" style="font-size:12px;padding:4px 10px">POST</span>
+                <strong class="mono" style="font-size:15px;color:#0f172a">/api/v1/send.php</strong>
                 <span style="font-size:12px;color:#64748b;margin-left:auto">Header: <code class="mono" style="color:var(--primary)">Authorization: Bearer &lt;API_KEY&gt;</code></span>
               </div>
-              <p style="font-size:13px;color:#334155;margin-bottom:14px">Dispatches single or bulk outbound SMS messages through your connected dual-SIM Android gateways.</p>
+              <p style="font-size:13px;color:#334155;margin-bottom:16px;line-height:1.5">Dispatch single or bulk outbound SMS messages through your connected Android gateway devices. Supports target SIM slot selection and device routing.</p>
               
-              <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px;text-transform:uppercase">Request Body (JSON)</div>
-              <pre class="mono" style="background:#0b1320;color:#f8fafc;padding:14px;border-radius:8px;font-size:12px;overflow-x:auto;margin-bottom:14px">{
-  "to": "017XXXXXXXX, 018XXXXXXXX", // Single or comma-separated numbers
-  "message": "Your verification code is 849201", // Required SMS text content
-  "sim_slot": 1, // Optional: 0 = Auto/Default, 1 = SIM 1, 2 = SIM 2
-  "device_id": "auto" // Optional: Specific Android device ID or "auto"
-}</pre>
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.04em">JSON Payload Parameters</div>
+              <div class="app-table-wrap" style="margin-bottom:16px">
+                <table class="app-table">
+                  <thead><tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
+                  <tbody>
+                    <tr><td class="mono">to / numbers</td><td><code class="mono">String | Array</code></td><td><span class="app-badge app-badge-rose">Required</span></td><td>Single phone number string or array of recipients (e.g. <code class="mono">"017XXXXXXXX"</code> or <code class="mono">["01711111111", "01822222222"]</code>)</td></tr>
+                    <tr><td class="mono">message</td><td><code class="mono">String</code></td><td><span class="app-badge app-badge-rose">Required</span></td><td>SMS body text content (max 1600 characters)</td></tr>
+                    <tr><td class="mono">sim_slot</td><td><code class="mono">Integer</code></td><td><span class="app-badge app-badge-teal">Optional</span></td><td>Target SIM card slot: <code class="mono">0</code> = Auto System SIM, <code class="mono">1</code> = SIM 1, <code class="mono">2</code> = SIM 2</td></tr>
+                    <tr><td class="mono">device_id</td><td><code class="mono">String</code></td><td><span class="app-badge app-badge-teal">Optional</span></td><td>Specific Android Gateway device ID (or <code class="mono">"auto"</code> for best online phone)</td></tr>
+                  </tbody>
+                </table>
+              </div>
 
-              <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px;text-transform:uppercase">Response (200 OK)</div>
-              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:8px;font-size:12px;overflow-x:auto">{
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Sample Response (200 OK)</div>
+              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">{
   "ok": true,
-  "msg_id": "msg_66da812f948201",
-  "count": 1,
-  "device": "dev_pixel8pro",
-  "sim_slot": 1
+  "message_id": "msg_66da812f948201",
+  "sent_count": 1,
+  "sim_slot": 1,
+  "queued": true
 }</pre>
             </div>
 
-            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:12px;padding:20px">
+            <!-- 2. Status Endpoint -->
+            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:14px;padding:20px">
               <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-                <span class="app-badge app-badge-teal" style="font-size:12px">GET / POST</span>
-                <strong class="mono" style="font-size:14px;color:#0f172a">/api/v1/status</strong>
+                <span class="app-badge app-badge-teal" style="font-size:12px;padding:4px 10px">GET</span>
+                <strong class="mono" style="font-size:15px;color:#0f172a">/api/v1/status.php</strong>
                 <span style="font-size:12px;color:#64748b;margin-left:auto">Header: <code class="mono" style="color:var(--primary)">Authorization: Bearer &lt;API_KEY&gt;</code></span>
               </div>
-              <p style="font-size:13px;color:#334155;margin-bottom:14px">Queries the real-time delivery status of any sent SMS message by ID.</p>
+              <p style="font-size:13px;color:#334155;margin-bottom:14px;line-height:1.5">Check real-time delivery status of any sent SMS message using its unique message ID.</p>
 
-              <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px;text-transform:uppercase">Endpoint Request</div>
-              <code class="mono" style="background:#e2e8f0;padding:6px 12px;border-radius:6px;font-size:12px;display:inline-block;margin-bottom:14px;color:#0f172a">GET <?php echo htmlspecialchars($appUrl); ?>/api/v1/status?msg_id=msg_66da812f948201</code>
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Query URL Parameter</div>
+              <code class="mono" style="background:#e2e8f0;padding:6px 12px;border-radius:6px;font-size:12px;display:inline-block;margin-bottom:14px;color:#0f172a">GET <?php echo htmlspecialchars($appUrl); ?>/api/v1/status.php?id=msg_66da812f948201</code>
 
-              <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px;text-transform:uppercase">Response (200 OK)</div>
-              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:8px;font-size:12px;overflow-x:auto">{
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Sample Response (200 OK)</div>
+              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">{
   "ok": true,
   "message_id": "msg_66da812f948201",
   "status": "delivered", // queued | processing | sent | delivered | failed
-  "error": null,
-  "sent_at": "2026-09-05 16:45:10"
+  "total_count": 1,
+  "sent_count": 1,
+  "failed_count": 0,
+  "queued_count": 0,
+  "created_at": "2026-09-13 16:45:10"
 }</pre>
             </div>
 
-            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:12px;padding:20px">
+            <!-- 3. Devices Endpoint -->
+            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:14px;padding:20px">
               <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-                <span class="app-badge app-badge-teal" style="font-size:12px">GET</span>
-                <strong class="mono" style="font-size:14px;color:#0f172a">/api/v1/receive</strong>
+                <span class="app-badge app-badge-teal" style="font-size:12px;padding:4px 10px">GET</span>
+                <strong class="mono" style="font-size:15px;color:#0f172a">/api/v1/devices.php</strong>
                 <span style="font-size:12px;color:#64748b;margin-left:auto">Header: <code class="mono" style="color:var(--primary)">Authorization: Bearer &lt;API_KEY&gt;</code></span>
               </div>
-              <p style="font-size:13px;color:#334155;margin-bottom:14px">Fetches incoming customer SMS messages received by your Android gateway phones.</p>
+              <p style="font-size:13px;color:#334155;margin-bottom:14px;line-height:1.5">Lists all connected Android gateway devices, online/offline statuses, and detected SIM card slots.</p>
 
-              <div style="font-size:12px;font-weight:600;color:#475569;margin-bottom:6px;text-transform:uppercase">Response (200 OK)</div>
-              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:8px;font-size:12px;overflow-x:auto">{
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Sample Response (200 OK)</div>
+              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">{
   "ok": true,
-  "messages": [
+  "count": 1,
+  "devices": [
     {
-      "id": 89,
-      "sender": "+8801712948201",
-      "message": "YES confirmed",
-      "sim_slot": 1,
-      "received_at": "2026-09-05 17:30:15"
+      "device_id": "dev_pixel8pro",
+      "device_name": "Pixel 8 Pro Gateway",
+      "model": "Pixel 8 Pro",
+      "status": "online",
+      "sms_sent_count": 1420,
+      "sims": [
+        { "slot": 1, "carrier": "Grameenphone", "phone_number": "017XXXXXXXX" },
+        { "slot": 2, "carrier": "Robi", "phone_number": "018XXXXXXXX" }
+      ]
     }
   ]
 }</pre>
             </div>
 
-            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:12px;padding:20px">
-              <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:12px">cURL Integration Example</div>
-              <pre class="mono" style="background:#0b1320;color:#93c5fd;padding:14px;border-radius:8px;font-size:12px;overflow-x:auto">curl -X POST <?php echo htmlspecialchars($appUrl); ?>/api/v1/send \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+            <!-- 4. Statistics Endpoint -->
+            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:14px;padding:20px">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+                <span class="app-badge app-badge-teal" style="font-size:12px;padding:4px 10px">GET</span>
+                <strong class="mono" style="font-size:15px;color:#0f172a">/api/v1/statistics.php</strong>
+                <span style="font-size:12px;color:#64748b;margin-left:auto">Header: <code class="mono" style="color:var(--primary)">Authorization: Bearer &lt;API_KEY&gt;</code></span>
+              </div>
+              <p style="font-size:13px;color:#334155;margin-bottom:14px;line-height:1.5">Query lifetime, monthly, weekly, and daily dispatch counts and online phone count.</p>
+
+              <div style="font-size:12px;font-weight:700;color:#475569;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em">Sample Response (200 OK)</div>
+              <pre class="mono" style="background:#0b1320;color:#a7f3d0;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">{
+  "ok": true,
+  "total_sent": 8490,
+  "today_sent": 145,
+  "week_sent": 1280,
+  "month_sent": 4920,
+  "api_keys_count": 3,
+  "devices_online_count": 2
+}</pre>
+            </div>
+
+            <!-- Code Snippets Examples -->
+            <div style="background:#f8fafc;border:1px solid var(--app-border-color);border-radius:14px;padding:20px">
+              <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:14px">Integration Code Examples</div>
+              
+              <div style="display:flex;flex-direction:column;gap:16px">
+                <!-- cURL -->
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                    <span style="font-size:12px;font-weight:700;color:#334155;text-transform:uppercase">cURL (Command Line)</span>
+                    <button type="button" class="app-btn app-btn-secondary" style="padding:2px 8px;font-size:11px" onclick="copyText(this.nextElementSibling.textContent, this)">Copy Code</button>
+                  </div>
+                  <pre class="mono" style="background:#0b1320;color:#93c5fd;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">curl -X POST <?php echo htmlspecialchars($appUrl); ?>/api/v1/send.php \
+  -H "Authorization: Bearer YOUR_SECRET_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "to": "017XXXXXXXX",
-    "message": "Hello World from SMSLink API",
+    "to": "017XXXXXXXX, 018XXXXXXXX",
+    "message": "Verification code is 849201",
     "sim_slot": 1
   }'</pre>
+                </div>
+
+                <!-- JavaScript Fetch -->
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                    <span style="font-size:12px;font-weight:700;color:#334155;text-transform:uppercase">JavaScript (Fetch API)</span>
+                    <button type="button" class="app-btn app-btn-secondary" style="padding:2px 8px;font-size:11px" onclick="copyText(this.nextElementSibling.textContent, this)">Copy Code</button>
+                  </div>
+                  <pre class="mono" style="background:#0b1320;color:#93c5fd;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">const res = await fetch('<?php echo htmlspecialchars($appUrl); ?>/api/v1/send.php', {
+  method: 'POST',
+  headers: {
+    'Authorization': 'Bearer YOUR_SECRET_API_KEY',
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    to: '017XXXXXXXX',
+    message: 'Verification code is 849201',
+    sim_slot: 1
+  })
+});
+const data = await res.json();
+console.log(data);</pre>
+                </div>
+
+                <!-- PHP -->
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                    <span style="font-size:12px;font-weight:700;color:#334155;text-transform:uppercase">PHP (cURL)</span>
+                    <button type="button" class="app-btn app-btn-secondary" style="padding:2px 8px;font-size:11px" onclick="copyText(this.nextElementSibling.textContent, this)">Copy Code</button>
+                  </div>
+                  <pre class="mono" style="background:#0b1320;color:#93c5fd;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">&lt;?php
+$ch = curl_init('<?php echo htmlspecialchars($appUrl); ?>/api/v1/send.php');
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_HTTPHEADER => [
+        'Authorization: Bearer YOUR_SECRET_API_KEY',
+        'Content-Type: application/json'
+    ],
+    CURLOPT_POSTFIELDS => json_encode([
+        'to' => '017XXXXXXXX',
+        'message' => 'Verification code is 849201',
+        'sim_slot' => 1
+    ])
+]);
+$response = json_decode(curl_exec($ch), true);
+curl_close($ch);
+print_r($response);</pre>
+                </div>
+
+                <!-- Python -->
+                <div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                    <span style="font-size:12px;font-weight:700;color:#334155;text-transform:uppercase">Python (Requests)</span>
+                    <button type="button" class="app-btn app-btn-secondary" style="padding:2px 8px;font-size:11px" onclick="copyText(this.nextElementSibling.textContent, this)">Copy Code</button>
+                  </div>
+                  <pre class="mono" style="background:#0b1320;color:#93c5fd;padding:14px;border-radius:10px;font-size:12px;overflow-x:auto">import requests
+
+url = "<?php echo htmlspecialchars($appUrl); ?>/api/v1/send.php"
+headers = {
+    "Authorization": "Bearer YOUR_SECRET_API_KEY",
+    "Content-Type": "application/json"
+}
+payload = {
+    "to": "017XXXXXXXX",
+    "message": "Verification code is 849201",
+    "sim_slot": 1
+}
+
+res = requests.post(url, json=payload, headers=headers)
+print(res.json())</pre>
+                </div>
+
+              </div>
             </div>
+
           </div>
         </div>
       </div>
 
       
-      <div class="section" id="section-team">
+      <div class="section <?php echo (($currentSec ?? '') === 'team') ? 'active' : ''; ?>" id="section-team">
         <div class="app-card" style="margin-bottom:20px;background:linear-gradient(135deg, #ffffff 0%, #f8fafc 100%)">
           <div class="app-card-header" style="flex-wrap:wrap;gap:16px">
             <div>
@@ -1721,7 +2196,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-settings">
+      <div class="section <?php echo (($currentSec ?? '') === 'settings') ? 'active' : ''; ?>" id="section-settings">
         <div class="app-card" style="max-width:680px;margin:0 auto">
           <div class="app-card-header">
             <div>
@@ -1760,6 +2235,20 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
               </div>
             </div>
 
+            <div class="app-form-grid" style="margin-top:4px">
+              <div class="app-form-group" style="margin-bottom:0">
+                <label class="app-label">Android Gateway APK Download URL</label>
+                <input type="url" name="app_apk_url" class="app-input" value="<?php echo htmlspecialchars($appApkUrl); ?>" placeholder="https://github.com/.../SMSLink-v1.0.0.apk">
+                <div style="font-size:11px;color:#64748b;margin-top:4px">Direct download URL for Gateway Android .APK release</div>
+              </div>
+
+              <div class="app-form-group" style="margin-bottom:0">
+                <label class="app-label">Android App Version Tag</label>
+                <input type="text" name="app_apk_version" class="app-input" value="<?php echo htmlspecialchars($appApkVersion); ?>" placeholder="v1.0.0">
+                <div style="font-size:11px;color:#64748b;margin-top:4px">Android app version (can be maintained independently)</div>
+              </div>
+            </div>
+
             <div style="display:flex;gap:12px;margin-top:6px">
               <button type="submit" class="app-btn app-btn-primary">Save Settings</button>
             </div>
@@ -1768,7 +2257,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-updates">
+      <div class="section <?php echo (($currentSec ?? '') === 'updates') ? 'active' : ''; ?>" id="section-updates">
         <div class="app-card" style="max-width:760px;margin:0 auto">
           <div class="app-card-header" style="flex-wrap:wrap;gap:12px">
             <div>
@@ -1835,7 +2324,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-about">
+      <div class="section <?php echo (($currentSec ?? '') === 'about') ? 'active' : ''; ?>" id="section-about">
         <div class="app-card" style="max-width:760px;margin:0 auto">
           <div style="text-align:center;padding:24px 10px 30px;border-bottom:1px solid var(--app-border-color)">
             <div style="display:flex;align-items:center;justify-content:center;margin:0 0 8px">
@@ -1908,7 +2397,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       </div>
 
       
-      <div class="section" id="section-profile">
+      <div class="section <?php echo (($currentSec ?? '') === 'profile') ? 'active' : ''; ?>" id="section-profile">
         <div class="app-card" style="max-width:640px;margin:0 auto">
           <div class="app-card-header">
             <div>
@@ -1988,8 +2477,10 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
       <div style="font-size:13px;color:#64748b;text-align:center">Generating QR Code...</div>
     </div>
 
-    <div style="font-size:12px;font-family:'Fira Code',monospace;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;padding:8px 14px;border-radius:10px;margin-bottom:20px;text-align:center" id="pairingCodeLabel"></div>
-    <button class="app-btn app-btn-secondary" onclick="closeQrModal()" style="width:100%;border-radius:10px;padding:10px">Close Window</button>
+    <div style="font-size:12px;color:#64748b;margin-bottom:14px;text-align:center">
+      Don't have the Gateway Android App yet? <a href="<?php echo htmlspecialchars($appApkUrl); ?>" target="_blank" download style="color:var(--primary);font-weight:600;text-decoration:none">Download .APK (<?php echo htmlspecialchars($appApkVersion); ?>) ↗</a>
+    </div>
+    <button class="app-btn app-btn-secondary" onclick="closeQrModal()" style="width:100%;border-radius:6px;padding:10px">Close Window</button>
   </div>
 </div>
 
@@ -2058,7 +2549,170 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
   </div>
 </div>
 
+<div class="app-modal-bg" id="confirmModal">
+  <div class="app-modal-card" style="text-align:center;max-width:400px;padding:24px">
+    <div id="confirmModalIcon" style="width:48px;height:48px;border-radius:50%;background:#fee2e2;color:#ef4444;display:flex;align-items:center;justify-content:center;margin:0 auto 14px">
+      <svg style="width:24px;height:24px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+    </div>
+    <h3 id="confirmModalTitle" style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:6px">Are you sure?</h3>
+    <p id="confirmModalMessage" style="font-size:13px;color:#64748b;margin-bottom:20px;line-height:1.5">This action cannot be undone.</p>
+    <div style="display:flex;gap:10px">
+      <button type="button" id="confirmModalBtnCancel" class="app-btn app-btn-secondary" style="flex:1">Cancel</button>
+      <button type="button" id="confirmModalBtnOk" class="app-btn app-btn-danger" style="flex:1">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <script>
+const validSections = ['status', 'send', 'sent', 'devices', 'apikeys', 'docs', 'team', 'settings', 'updates', 'about', 'profile'];
+
+// --- TOAST NOTIFICATIONS ---
+function showToast(message, type = 'success', duration = 3500) {
+  let container = document.getElementById('toastContainer');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toastContainer';
+    document.body.appendChild(container);
+  }
+
+  const icons = {
+    success: `<svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>`,
+    error: `<svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>`,
+    warning: `<svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>`,
+    info: `<svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`
+  };
+
+  const toast = document.createElement('div');
+  toast.className = `toast-item toast-${type}`;
+  toast.innerHTML = `
+    <div class="toast-icon">${icons[type] || icons.info}</div>
+    <div style="flex:1">${escapeHtml(message)}</div>
+    <button type="button" class="toast-close" onclick="this.parentElement.classList.remove('toast-show'); setTimeout(()=>this.parentElement.remove(), 300);">&times;</button>
+  `;
+
+  container.appendChild(toast);
+  requestAnimationFrame(() => {
+    toast.classList.add('toast-show');
+  });
+
+  if (duration > 0) {
+    setTimeout(() => {
+      if (toast.parentElement) {
+        toast.classList.remove('toast-show');
+        setTimeout(() => toast.remove(), 300);
+      }
+    }, duration);
+  }
+}
+
+// --- BUTTON LOADER HELPER ---
+function setButtonLoading(btn, isLoading, loadingText = '') {
+  if (!btn) return;
+  if (isLoading) {
+    if (!btn.dataset.origHtml) btn.dataset.origHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.classList.add('btn-loading');
+    const text = loadingText || 'Processing...';
+    btn.innerHTML = `<span class="btn-spinner"></span> <span>${escapeHtml(text)}</span>`;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove('btn-loading');
+    if (btn.dataset.origHtml) {
+      btn.innerHTML = btn.dataset.origHtml;
+      delete btn.dataset.origHtml;
+    }
+  }
+}
+
+// --- CONFIRMATION MODAL HELPER ---
+function showConfirmModal({ title = 'Are you sure?', message = 'This action cannot be undone.', confirmText = 'Confirm', type = 'danger', onConfirm }) {
+  const modal = document.getElementById('confirmModal');
+  const titleEl = document.getElementById('confirmModalTitle');
+  const msgEl = document.getElementById('confirmModalMessage');
+  const btnOk = document.getElementById('confirmModalBtnOk');
+  const btnCancel = document.getElementById('confirmModalBtnCancel');
+  const iconEl = document.getElementById('confirmModalIcon');
+
+  if (!modal) return;
+
+  if (titleEl) titleEl.textContent = title;
+  if (msgEl) msgEl.textContent = message;
+  if (btnOk) {
+    btnOk.textContent = confirmText;
+    btnOk.className = type === 'danger' ? 'app-btn app-btn-danger' : 'app-btn app-btn-primary';
+  }
+  if (iconEl) {
+    iconEl.style.background = type === 'danger' ? '#fee2e2' : '#dcfce7';
+    iconEl.style.color = type === 'danger' ? '#ef4444' : '#10b981';
+  }
+
+  modal.style.display = 'flex';
+
+  const close = () => { modal.style.display = 'none'; };
+
+  btnCancel.onclick = () => { close(); };
+  btnOk.onclick = async () => {
+    close();
+    if (onConfirm) await onConfirm();
+  };
+}
+
+// --- AUTH FETCH INTERCEPTOR FOR INSTANT LOGOUT DETECTION ---
+async function authFetch(url, options = {}) {
+  try {
+    const res = await fetch(url, options);
+    if (res.status === 401 || res.status === 403) {
+      handleLoggedOutState();
+      throw new Error('Unauthenticated');
+    }
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) {}
+
+    if (data && data.authed === false) {
+      handleLoggedOutState();
+      throw new Error('Unauthenticated');
+    }
+    return { res, text, data };
+  } catch (err) {
+    if (err.message === 'Unauthenticated') throw err;
+    throw err;
+  }
+}
+
+function handleLoggedOutState() {
+  if (window._isLoggedOutHandled) return;
+  window._isLoggedOutHandled = true;
+  showToast('Session expired. Please sign in again.', 'warning', 4000);
+  setTimeout(() => {
+    window.location.reload();
+  }, 1000);
+}
+
+// --- DYNAMIC DEVICE RE-SYNCING (REACT-LIKE REFRESH) ---
+async function syncDevicesState() {
+  try {
+    const { data } = await authFetch('?action=get_devices_json');
+    if (data && data.ok && Array.isArray(data.devices)) {
+      const devices = data.devices;
+      const selectEl = document.getElementById('sendDevice');
+      if (selectEl) {
+        const currentVal = selectEl.value;
+        let optionsHtml = '<option value="auto">Auto</option>';
+        devices.forEach(d => {
+          const devName = escapeHtml(d.device_name || d.model || 'Gateway Device');
+          const devId = escapeHtml(d.device_id);
+          optionsHtml += `<option value="${devId}">${devName}</option>`;
+        });
+        selectEl.innerHTML = optionsHtml;
+        if (currentVal && Array.from(selectEl.options).some(o => o.value === currentVal)) {
+          selectEl.value = currentVal;
+        }
+      }
+    }
+  } catch (e) {}
+}
+
 function toggleMobileSidebar(){
   const sb = document.getElementById('appSidebar');
   const ov = document.getElementById('sidebarOverlay');
@@ -2232,7 +2886,24 @@ document.addEventListener('click', function(e){
   }
 });
 
-const validSections = ['status', 'send', 'sent', 'devices', 'apikeys', 'docs', 'team', 'settings', 'updates', 'about', 'profile'];
+function toggleMobileSearch(open) {
+  const topbar = document.getElementById('appTopbar');
+  const searchInput = document.getElementById('globalSearchInput');
+  if (open) {
+    topbar?.classList.add('search-active');
+    setTimeout(() => { searchInput?.focus(); }, 50);
+  } else {
+    topbar?.classList.remove('search-active');
+    const resContainer = document.getElementById('globalSearchResults');
+    if (resContainer) resContainer.style.display = 'none';
+  }
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    toggleMobileSearch(false);
+  }
+});
 
 function getDashboardBasePath() {
   let path = window.location.pathname;
@@ -2283,6 +2954,9 @@ function showSection(id, el, updateHistory = true){
     refreshSentMessagesList();
   } else if (id === 'devices') {
     refreshDeviceList();
+    syncDevicesState();
+  } else if (id === 'send') {
+    syncDevicesState();
   }
 }
 
@@ -2415,6 +3089,7 @@ function autoDetectUrl(){
   loc = loc.replace(/\/dashboard\/?.*$/, '');
   loc = loc.replace(/\/+$/, '');
   document.getElementById('appUrlInput').value = loc;
+  showToast('Base URL auto-detected!', 'info', 2000);
 }
 
 function openAddMemberModal(){
@@ -2458,14 +3133,14 @@ function filterTeamMembers(query){
 }
 
 async function toggleMemberStatus(userId){
+  const btn = document.getElementById('btn-status-' + userId);
+  if (btn) setButtonLoading(btn, true, 'Updating...');
   const fd = new FormData();
   fd.append('user_id', userId);
   try {
-    const r = await fetch('?action=toggle_member_status', {method:'POST', body:fd});
-    const d = await r.json();
-    if(d.ok){
+    const { data: d } = await authFetch('?action=toggle_member_status', {method:'POST', body:fd});
+    if(d && d.ok){
       const badge = document.getElementById('status-badge-' + userId);
-      const btn = document.getElementById('btn-status-' + userId);
       if(badge){
         badge.className = 'app-badge ' + (d.status === 'active' ? 'app-badge-green' : 'app-badge-amber');
         badge.textContent = d.status === 'active' ? 'Active' : 'Pending';
@@ -2473,184 +3148,140 @@ async function toggleMemberStatus(userId){
       if(btn){
         btn.textContent = d.status === 'active' ? 'Suspend' : 'Activate';
       }
+      showToast(`Member status set to ${d.status}`, 'success');
     } else {
-      alert(d.error || 'Failed to toggle status');
+      showToast((d && d.error) ? d.error : 'Failed to toggle status', 'error');
     }
   } catch(e){
-    alert('Network error');
+    if (e.message !== 'Unauthenticated') showToast('Network error toggling status', 'error');
+  } finally {
+    if (btn) setButtonLoading(btn, false);
   }
 }
 
 async function deleteTeamMember(userId, username){
-  if(!confirm('Are you sure you want to delete team member "' + username + '"?')) return;
-  const fd = new FormData();
-  fd.append('user_id', userId);
-  try {
-    const r = await fetch('?action=delete_team_member', {method:'POST', body:fd});
-    const d = await r.json();
-    if(d.ok){
-      const row = document.getElementById('member-row-' + userId);
-      if(row) row.remove();
-    } else {
-      alert(d.error || 'Failed to delete member');
+  showConfirmModal({
+    title: 'Delete Team Member?',
+    message: `Are you sure you want to delete team member "${username}"?`,
+    confirmText: 'Delete Member',
+    type: 'danger',
+    onConfirm: async () => {
+      const fd = new FormData();
+      fd.append('user_id', userId);
+      try {
+        const { data: d } = await authFetch('?action=delete_team_member', {method:'POST', body:fd});
+        if(d && d.ok){
+          const row = document.getElementById('member-row-' + userId);
+          if(row) row.remove();
+          showToast(`Team member "${username}" deleted`, 'success');
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to delete member', 'error');
+        }
+      } catch(e){
+        if (e.message !== 'Unauthenticated') showToast('Network error deleting member', 'error');
+      }
     }
-  } catch(e){
-    alert('Network error');
-  }
+  });
 }
 
 document.addEventListener('DOMContentLoaded', function(){
   const sForm = document.getElementById('settingsForm');
   if(sForm){
-    sForm.addEventListener('submit', function(e){
+    sForm.addEventListener('submit', async function(e){
       e.preventDefault();
-      const notice = document.getElementById('settingsNotice');
+      const btn = this.querySelector('button[type="submit"]');
+      setButtonLoading(btn, true, 'Saving...');
       const fd = new FormData(this);
-      fetch('?action=update_settings', {method:'POST', body:fd})
-        .then(r=>r.json())
-        .then(d=>{
-          if(d.ok){
-            notice.style.display = 'block';
-            notice.style.background = 'var(--primary-light)';
-            notice.style.color = 'var(--primary)';
-            notice.style.border = '1px solid rgba(5,125,119,0.3)';
-            notice.textContent = d.message || 'System settings updated successfully!';
-            
-            const themeCol = document.getElementById('themeColorInput')?.value;
-            const themeHov = document.getElementById('themeHoverInput')?.value;
-            if(themeCol) document.documentElement.style.setProperty('--primary', themeCol);
-            if(themeHov) document.documentElement.style.setProperty('--primary-hover', themeHov);
-
-            setTimeout(()=>{
-              window.location.reload();
-            }, 800);
-          } else {
-            notice.style.display = 'block';
-            notice.style.background = '#fef2f2';
-            notice.style.color = '#dc2626';
-            notice.style.border = '1px solid #fecaca';
-            notice.textContent = d.error || 'Failed to update settings';
-          }
-        })
-        .catch(()=>{
-          notice.style.display = 'block';
-          notice.style.background = '#fef2f2';
-          notice.style.color = '#dc2626';
-          notice.style.border = '1px solid #fecaca';
-          notice.textContent = 'Network error occurred';
-        });
+      try {
+        const { data: d } = await authFetch('?action=update_settings', {method:'POST', body:fd});
+        setButtonLoading(btn, false);
+        if(d && d.ok){
+          showToast(d.message || 'Settings updated successfully!', 'success');
+          const themeCol = document.getElementById('themeColorInput')?.value;
+          const themeHov = document.getElementById('themeHoverInput')?.value;
+          if(themeCol) document.documentElement.style.setProperty('--primary', themeCol);
+          if(themeHov) document.documentElement.style.setProperty('--primary-hover', themeHov);
+          setTimeout(()=> window.location.reload(), 800);
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to update settings', 'error');
+        }
+      } catch(e) {
+        setButtonLoading(btn, false);
+        if (e.message !== 'Unauthenticated') showToast('Network error updating settings', 'error');
+      }
     });
   }
 
   const pForm = document.getElementById('profileForm');
   if(pForm){
-    pForm.addEventListener('submit', function(e){
+    pForm.addEventListener('submit', async function(e){
       e.preventDefault();
-      const notice = document.getElementById('profileNotice');
+      const btn = this.querySelector('button[type="submit"]');
+      setButtonLoading(btn, true, 'Saving...');
       const fd = new FormData(this);
-      fetch('?action=update_profile', {method:'POST', body:fd})
-        .then(r=>r.json())
-        .then(d=>{
-          if(d.ok){
-            notice.style.display = 'block';
-            notice.style.background = 'var(--primary-light)';
-            notice.style.color = 'var(--primary)';
-            notice.style.border = '1px solid rgba(5,125,119,0.3)';
-            notice.textContent = d.message || 'Profile updated successfully!';
-            setTimeout(()=>location.reload(), 1200);
-          } else {
-            notice.style.display = 'block';
-            notice.style.background = '#fef2f2';
-            notice.style.color = '#dc2626';
-            notice.style.border = '1px solid #fecaca';
-            notice.textContent = d.error || 'Failed to update profile';
-          }
-        })
-        .catch(()=>{
-          notice.style.display = 'block';
-          notice.style.background = '#fef2f2';
-          notice.style.color = '#dc2626';
-          notice.style.border = '1px solid #fecaca';
-          notice.textContent = 'Network error occurred';
-        });
+      try {
+        const { data: d } = await authFetch('?action=update_profile', {method:'POST', body:fd});
+        setButtonLoading(btn, false);
+        if(d && d.ok){
+          showToast(d.message || 'Profile updated successfully!', 'success');
+          setTimeout(()=>location.reload(), 1000);
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to update profile', 'error');
+        }
+      } catch(e) {
+        setButtonLoading(btn, false);
+        if (e.message !== 'Unauthenticated') showToast('Network error updating profile', 'error');
+      }
     });
   }
 
   const addMemForm = document.getElementById('addMemberForm');
   if(addMemForm){
-    addMemForm.addEventListener('submit', function(e){
+    addMemForm.addEventListener('submit', async function(e){
       e.preventDefault();
-      const notice = document.getElementById('addMemberNotice');
+      const btn = this.querySelector('button[type="submit"]');
+      setButtonLoading(btn, true, 'Creating...');
       const fd = new FormData(this);
-      fetch('?action=add_team_member', {method:'POST', body:fd})
-        .then(r=>r.json())
-        .then(d=>{
-          if(d.ok){
-            notice.style.display = 'block';
-            notice.style.background = 'var(--primary-light)';
-            notice.style.color = 'var(--primary)';
-            notice.style.border = '1px solid rgba(5,125,119,0.3)';
-            let msg = d.message || 'Member added!';
-            if(d.generated_password){
-              msg += ' (Generated password: ' + d.generated_password + ')';
-            }
-            notice.textContent = msg;
-            setTimeout(() => {
-              window.location.reload();
-            }, 1200);
-          } else {
-            notice.style.display = 'block';
-            notice.style.background = '#fef2f2';
-            notice.style.color = '#dc2626';
-            notice.style.border = '1px solid #fecaca';
-            notice.textContent = d.error || 'Failed to add member';
-          }
-        })
-        .catch(()=>{
-          notice.style.display = 'block';
-          notice.style.background = '#fef2f2';
-          notice.style.color = '#dc2626';
-          notice.style.border = '1px solid #fecaca';
-          notice.textContent = 'Network error occurred';
-        });
+      try {
+        const { data: d } = await authFetch('?action=add_team_member', {method:'POST', body:fd});
+        setButtonLoading(btn, false);
+        if(d && d.ok){
+          showToast(d.message || 'Team member created!', 'success');
+          setTimeout(() => { window.location.reload(); }, 1000);
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to add member', 'error');
+        }
+      } catch(e) {
+        setButtonLoading(btn, false);
+        if (e.message !== 'Unauthenticated') showToast('Network error creating member', 'error');
+      }
     });
   }
 
   const setPwdForm = document.getElementById('setPasswordForm');
   if(setPwdForm){
-    setPwdForm.addEventListener('submit', function(e){
+    setPwdForm.addEventListener('submit', async function(e){
       e.preventDefault();
-      const notice = document.getElementById('setPasswordNotice');
+      const btn = this.querySelector('button[type="submit"]');
+      setButtonLoading(btn, true, 'Updating...');
       const fd = new FormData(this);
-      fetch('?action=set_team_member_password', {method:'POST', body:fd})
-        .then(r=>r.json())
-        .then(d=>{
-          if(d.ok){
-            notice.style.display = 'block';
-            notice.style.background = 'var(--primary-light)';
-            notice.style.color = 'var(--primary)';
-            notice.style.border = '1px solid rgba(5,125,119,0.3)';
-            notice.textContent = d.message || 'Password updated successfully!';
-            setTimeout(() => {
-              closeSetPasswordModal();
-            }, 1000);
-          } else {
-            notice.style.display = 'block';
-            notice.style.background = '#fef2f2';
-            notice.style.color = '#dc2626';
-            notice.style.border = '1px solid #fecaca';
-            notice.textContent = d.error || 'Failed to update password';
-          }
-        })
-        .catch(()=>{
-          notice.style.display = 'block';
-          notice.style.background = '#fef2f2';
-          notice.style.color = '#dc2626';
-          notice.style.border = '1px solid #fecaca';
-          notice.textContent = 'Network error occurred';
-        });
+      try {
+        const { data: d } = await authFetch('?action=set_team_member_password', {method:'POST', body:fd});
+        setButtonLoading(btn, false);
+        if(d && d.ok){
+          showToast(d.message || 'Password updated successfully!', 'success');
+          closeSetPasswordModal();
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to update password', 'error');
+        }
+      } catch(e) {
+        setButtonLoading(btn, false);
+        if (e.message !== 'Unauthenticated') showToast('Network error setting password', 'error');
+      }
     });
   }
+  loadCountryCodeCache();
+  syncDevicesState();
 });
 
 function filterSentMessages(){
@@ -2809,84 +3440,348 @@ setInterval(() => {
   }
 }, 3000);
 
-async function deleteDevice(deviceId, deviceName) {
-  if (!confirm(`Are you sure you want to delete device "${deviceName}"?`)) return;
-
-  try {
-    const res = await fetch('?action=delete_device', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ device_id: deviceId })
-    });
-    const text = await res.text();
-    let data = null;
-    try { data = JSON.parse(text); } catch (e) {}
-
-    if (data && data.ok) {
-      await refreshDeviceList();
-    } else {
-      alert((data && data.error) ? data.error : (text || 'Failed to delete device'));
+async function deleteDevice(deviceId, deviceName, btnElement) {
+  showConfirmModal({
+    title: 'Delete Gateway Device?',
+    message: `Are you sure you want to delete gateway phone "${deviceName}"? It will no longer process outbound SMS messages.`,
+    confirmText: 'Delete Device',
+    type: 'danger',
+    onConfirm: async () => {
+      if (btnElement) setButtonLoading(btnElement, true, 'Deleting...');
+      try {
+        const { data } = await authFetch('?action=delete_device', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ device_id: deviceId })
+        });
+        if (data && data.ok) {
+          showToast('Gateway device deleted successfully', 'success');
+          await refreshDeviceList();
+          await syncDevicesState();
+        } else {
+          showToast((data && data.error) ? data.error : 'Failed to delete device', 'error');
+        }
+      } catch (e) {
+        if (e.message !== 'Unauthenticated') showToast('Network error deleting device', 'error');
+      } finally {
+        if (btnElement) setButtonLoading(btnElement, false);
+      }
     }
-  } catch (e) {
-    alert('Network error deleting device: ' + e.message);
+  });
+}
+
+const COUNTRY_DATA = [
+  { iso: 'bd', name: 'Bangladesh', code: '+880' },
+  { iso: 'in', name: 'India', code: '+91' },
+  { iso: 'us', name: 'United States', code: '+1' },
+  { iso: 'gb', name: 'United Kingdom', code: '+44' },
+  { iso: 'sa', name: 'Saudi Arabia', code: '+966' },
+  { iso: 'ae', name: 'United Arab Emirates', code: '+971' },
+  { iso: 'my', name: 'Malaysia', code: '+60' },
+  { iso: 'sg', name: 'Singapore', code: '+65' },
+  { iso: 'pk', name: 'Pakistan', code: '+92' },
+  { iso: 'qa', name: 'Qatar', code: '+974' },
+  { iso: 'kw', name: 'Kuwait', code: '+965' },
+  { iso: 'om', name: 'Oman', code: '+968' },
+  { iso: 'bh', name: 'Bahrain', code: '+973' },
+  { iso: 'ca', name: 'Canada', code: '+1' },
+  { iso: 'au', name: 'Australia', code: '+61' },
+  { iso: 'de', name: 'Germany', code: '+49' },
+  { iso: 'fr', name: 'France', code: '+33' },
+  { iso: 'none', name: 'Raw / No Prefix', code: '' }
+];
+
+function renderCountryOptions(filterText = '') {
+  const container = document.getElementById('countryOptionsList');
+  if (!container) return;
+  const query = filterText.toLowerCase().trim();
+  const filtered = COUNTRY_DATA.filter(c => c.name.toLowerCase().includes(query) || c.code.includes(query) || c.iso.includes(query));
+  
+  let html = '';
+  filtered.forEach(c => {
+    const flagSrc = c.iso !== 'none' ? `https://flagcdn.com/w40/${c.iso}.png` : '';
+    const flagEl = c.iso !== 'none' 
+      ? `<img src="${flagSrc}" alt="${c.iso}" style="width:20px;height:14px;object-fit:cover;border-radius:2px;box-shadow:0 0 1px rgba(0,0,0,0.4)">`
+      : `<span style="width:20px;text-align:center">🌐</span>`;
+    html += `
+      <div class="country-option-item" onclick="selectCountryOption('${c.code}', '${c.iso}')" style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;cursor:pointer;font-size:13px;color:#0f172a;transition:background 0.1s">
+        <div style="display:flex;align-items:center;gap:10px">
+          ${flagEl}
+          <span>${escapeHtml(c.name)}</span>
+        </div>
+        <span class="mono" style="font-weight:600;color:#64748b">${escapeHtml(c.code)}</span>
+      </div>
+    `;
+  });
+  if (filtered.length === 0) {
+    html = '<div style="padding:16px;text-align:center;font-size:12px;color:#94a3b8">No matching country</div>';
+  }
+  container.innerHTML = html;
+}
+
+function filterCountryOptions(query) {
+  renderCountryOptions(query);
+}
+
+function toggleBulkMode(isBulk) {
+  const label = document.getElementById('phoneInputLabel');
+  const input = document.getElementById('sendNumbers');
+  
+  if (isBulk) {
+    if (label) label.textContent = 'Recipient Phone Numbers (comma-separated)';
+    if (input) input.placeholder = '017XXXXXXXX, 018XXXXXXXX';
+  } else {
+    if (label) label.textContent = 'Recipient Phone Number';
+    if (input) input.placeholder = '';
+  }
+  onPhoneInputChanged();
+}
+
+function updateSmsCharCount() {
+  const textarea = document.getElementById('sendMessage');
+  const countEl = document.getElementById('msgCharCount');
+  const warningEl = document.getElementById('charLimitWarning');
+  if (!textarea) return;
+  const len = textarea.value.length;
+  if (countEl) countEl.textContent = len;
+  if (warningEl) {
+    warningEl.style.display = len >= 160 ? 'inline' : 'none';
   }
 }
 
+function validateSinglePhoneNumber(rawNumber, countryCode) {
+  const clean = rawNumber.replace(/[\s\-\(\)\.]/g, '');
+  if (!clean) {
+    return { valid: false, empty: true, message: 'Enter phone number' };
+  }
+
+  // BD specific validation
+  if (countryCode === '+880') {
+    let digits = clean;
+    if (digits.startsWith('+880')) digits = digits.substring(4);
+    else if (digits.startsWith('880')) digits = digits.substring(3);
+
+    let opName = 'BD Mobile';
+    const p3 = digits.substring(0, 3);
+    const p2 = digits.substring(0, 2);
+    
+    if (['017', '17', '013', '13'].includes(p3) || ['17', '13'].includes(p2)) opName = 'Grameenphone';
+    else if (['018', '18', '016', '16'].includes(p3) || ['18', '16'].includes(p2)) opName = 'Robi / Airtel';
+    else if (['019', '19', '014', '14'].includes(p3) || ['14', '19'].includes(p2)) opName = 'Banglalink';
+    else if (['015', '15'].includes(p3) || ['15'].includes(p2)) opName = 'Teletalk';
+
+    if (digits.startsWith('0') && digits.length === 11) {
+      if (/^01[3-9]\d{8}$/.test(digits)) {
+        return { valid: true, message: `✓ Valid ${opName} number (+880${digits.substring(1)})` };
+      } else {
+        return { valid: false, message: '⚠ Invalid BD mobile operator prefix (013 - 019)' };
+      }
+    } else if (!digits.startsWith('0') && digits.length === 10) {
+      if (/^1[3-9]\d{8}$/.test(digits)) {
+        return { valid: true, message: `✓ Valid ${opName} number (+880${digits})` };
+      } else {
+        return { valid: false, message: '⚠ Invalid BD mobile operator prefix (13 - 19)' };
+      }
+    } else {
+      if (digits.length < 10) {
+        return { valid: false, partial: true, message: `Entering BD number (${digits.length}/11 digits...)` };
+      }
+      return { valid: false, message: '⚠ Bangladesh mobile numbers must be 11 digits (with 0) or 10 digits (without 0)' };
+    }
+  }
+
+  // India (+91)
+  if (countryCode === '+91') {
+    let d = clean.replace(/^\+91/, '');
+    if (/^[6-9]\d{9}$/.test(d)) {
+      return { valid: true, message: `✓ Valid India mobile number (+91${d})` };
+    } else if (d.length < 10) {
+      return { valid: false, partial: true, message: `Entering India number (${d.length}/10 digits...)` };
+    } else {
+      return { valid: false, message: '⚠ India mobile numbers must be 10 digits starting with 6-9' };
+    }
+  }
+
+  // US/Canada (+1)
+  if (countryCode === '+1') {
+    let d = clean.replace(/^\+1/, '');
+    if (/^[2-9]\d{9}$/.test(d)) {
+      return { valid: true, message: `✓ Valid US/CA number (+1${d})` };
+    } else if (d.length < 10) {
+      return { valid: false, partial: true, message: `Entering US/CA number (${d.length}/10 digits...)` };
+    } else {
+      return { valid: false, message: '⚠ US/CA numbers must be 10 digits' };
+    }
+  }
+
+  // Generic fallback
+  const allDigits = clean.replace(/\D/g, '');
+  if (allDigits.length >= 7 && allDigits.length <= 15) {
+    return { valid: true, message: `✓ Valid international phone number` };
+  } else if (allDigits.length > 0) {
+    return { valid: false, partial: true, message: `Entering phone number (${allDigits.length} digits...)` };
+  }
+  return { valid: false, empty: true, message: 'Enter phone number' };
+}
+
+function onPhoneInputChanged() {
+  const isBulk = document.getElementById('bulkModeToggle')?.checked;
+  const inputVal = document.getElementById('sendNumbers')?.value.trim() || '';
+  const statusEl = document.getElementById('phoneValidationStatus');
+  const countryCode = document.getElementById('countryCodeSelect')?.value || '+880';
+  if (!statusEl) return;
+
+  if (!inputVal) {
+    statusEl.style.color = '#64748b';
+    statusEl.innerHTML = isBulk ? 'Enter comma-separated phone numbers' : 'Enter phone number (e.g. 017XXXXXXXX)';
+    return;
+  }
+
+  if (isBulk) {
+    const list = inputVal.split(',').map(n => n.trim()).filter(n => n.length > 0);
+    const validCount = list.filter(n => validateSinglePhoneNumber(n, countryCode).valid).length;
+    statusEl.style.color = validCount === list.length ? '#10b981' : '#b45309';
+    statusEl.innerHTML = `Total ${list.length} recipient number(s) entered (${validCount} valid format)`;
+  } else {
+    const res = validateSinglePhoneNumber(inputVal, countryCode);
+    if (res.valid) {
+      statusEl.style.color = '#10b981';
+      statusEl.innerHTML = escapeHtml(res.message);
+    } else if (res.partial) {
+      statusEl.style.color = '#0284c7';
+      statusEl.innerHTML = escapeHtml(res.message);
+    } else if (res.empty) {
+      statusEl.style.color = '#64748b';
+      statusEl.innerHTML = escapeHtml(res.message);
+    } else {
+      statusEl.style.color = '#ef4444';
+      statusEl.innerHTML = escapeHtml(res.message);
+    }
+  }
+}
+
+function selectCountryOption(code, iso) {
+  const hidden = document.getElementById('countryCodeSelect');
+  if (hidden) hidden.value = code;
+  
+  const flagImg = document.getElementById('selectedFlagImg');
+  if (flagImg) {
+    if (iso !== 'none') {
+      flagImg.style.display = 'inline-block';
+      flagImg.src = `https://flagcdn.com/w40/${iso}.png`;
+    } else {
+      flagImg.style.display = 'none';
+    }
+  }
+  const dialSpan = document.getElementById('selectedDialCode');
+  if (dialSpan) dialSpan.textContent = code || 'Raw';
+  
+  saveCountryCodeCache(code, iso);
+  closeCountryPicker();
+  onPhoneInputChanged();
+}
+
 async function doSend(){
-  const numbers = document.getElementById('sendNumbers').value.trim();
+  const sendBtn = document.querySelector('#section-send .app-btn-primary');
+  const ccEl = document.getElementById('countryCodeSelect');
+  const countryCode = ccEl ? ccEl.value : '';
+  if (countryCode) saveCountryCodeCache(countryCode);
+
+  let rawNumbers = document.getElementById('sendNumbers').value.trim();
   const message = document.getElementById('sendMessage').value.trim();
   const device  = document.getElementById('sendDevice').value;
-  const simSlot = document.getElementById('sendSimSlot').value;
+  const simSlot = getSelectedSimSlot();
   const statusEl = document.getElementById('sendStatus');
-  if(!numbers || !message){ alert('Please enter phone numbers and message content.'); return; }
-  statusEl.textContent = 'Queuing message...'; statusEl.style.color = '#b45309';
+  const isBulk = document.getElementById('bulkModeToggle')?.checked;
+
+  if(!rawNumbers || !message){ showToast('Please enter recipient phone number and SMS content.', 'warning'); return; }
+
+  if (!isBulk) {
+    const valRes = validateSinglePhoneNumber(rawNumbers, countryCode);
+    if (!valRes.valid) {
+      showToast(valRes.message.replace('✓ ', '').replace('⚠ ', ''), 'warning');
+      return;
+    }
+  }
+
+  let numberList = rawNumbers.split(',').map(n => n.trim()).filter(n => n.length > 0);
+  if (countryCode && countryCode !== '') {
+    numberList = numberList.map(num => {
+      if (num.startsWith('+')) return num;
+      if (num.startsWith('0')) {
+        return countryCode + num.substring(1);
+      }
+      return countryCode + num;
+    });
+  }
+  const formattedNumbers = numberList.join(', ');
+
+  setButtonLoading(sendBtn, true, 'Queuing SMS...');
+  if (statusEl) { statusEl.textContent = 'Queuing message...'; statusEl.style.color = '#b45309'; }
+
   const fd = new FormData();
-  fd.append('numbers', numbers);
+  fd.append('numbers', formattedNumbers);
   fd.append('message', message);
   fd.append('device', device);
   fd.append('sim_slot', simSlot);
+
   try {
-    const r = await fetch('?action=send_sms', {method:'POST', body:fd});
-    const d = await r.json();
-    if(d.ok){
-      statusEl.textContent = 'Queued successfully!'; statusEl.style.color = '#057d77';
-      document.getElementById('sendNumbers').value = ''; document.getElementById('sendMessage').value = '';
+    const { data: d } = await authFetch('?action=send_sms', {method:'POST', body:fd});
+    setButtonLoading(sendBtn, false);
+    if(d && d.ok){
+      if (statusEl) { statusEl.textContent = 'Queued successfully!'; statusEl.style.color = '#057d77'; }
+      showToast(`SMS queued successfully for ${d.count || 1} recipient(s)!`, 'success');
+      document.getElementById('sendNumbers').value = '';
+      document.getElementById('sendMessage').value = '';
+      updateSmsCharCount();
+      onPhoneInputChanged();
+      refreshSentMessagesList();
     } else {
-      statusEl.textContent = d.error || 'Failed'; statusEl.style.color = '#ef4444';
+      const err = (d && d.error) ? d.error : 'Failed to send SMS';
+      if (statusEl) { statusEl.textContent = err; statusEl.style.color = '#ef4444'; }
+      showToast(err, 'error');
     }
-  } catch(e) { statusEl.textContent = 'Connection error'; statusEl.style.color = '#ef4444'; }
+  } catch(e) {
+    setButtonLoading(sendBtn, false);
+    if (statusEl) { statusEl.textContent = 'Connection error'; statusEl.style.color = '#ef4444'; }
+    if (e.message !== 'Unauthenticated') showToast('Network error while sending SMS', 'error');
+  }
 }
 
-async function retrySms(id){
-  const fd = new FormData(); fd.append('msg_id', id);
-  const r = await fetch('?action=retry_sms', {method:'POST', body:fd});
-  const d = await r.json();
-  if(d.ok) location.reload();
+async function retrySms(id, btnElement){
+  if (btnElement) setButtonLoading(btnElement, true, 'Retrying...');
+  try {
+    const fd = new FormData(); fd.append('msg_id', id);
+    const { data: d } = await authFetch('?action=retry_sms', {method:'POST', body:fd});
+    if(d && d.ok) {
+      showToast('SMS re-queued for delivery!', 'success');
+      await refreshSentMessagesList();
+    } else {
+      showToast((d && d.error) ? d.error : 'Failed to retry SMS', 'error');
+    }
+  } catch(e) {
+    if (e.message !== 'Unauthenticated') showToast('Network error retrying SMS', 'error');
+  } finally {
+    if (btnElement) setButtonLoading(btnElement, false);
+  }
 }
 
 async function genApiKey(){
   const inputEl = document.getElementById('keyName');
   const name = inputEl ? inputEl.value.trim() : '';
   const btn = document.getElementById('btnGenKey');
-  if(!name) return;
+  if(!name) { showToast('Please enter a token identifier / system name.', 'warning'); return; }
 
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = `<svg style="width:16px;height:16px;animation:spin 1s linear infinite" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"></circle><path d="M12 2a10 10 0 0 1 10 10" stroke-opacity="1"></path></svg> Generating...`;
-  }
+  setButtonLoading(btn, true, 'Generating...');
 
   try {
     const fd = new FormData(); fd.append('key_name', name);
-    const r = await fetch('?action=gen_api_key', {method:'POST', body:fd});
-    const d = await r.json();
+    const { data: d } = await authFetch('?action=gen_api_key', {method:'POST', body:fd});
+    setButtonLoading(btn, false);
 
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `<svg style="width:16px;height:16px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/></svg> Generate Secret Key`;
-    }
-
-    if(d.ok){
+    if(d && d.ok){
       if(inputEl) inputEl.value = '';
+      showToast('New secret API key generated successfully!', 'success');
 
       const banner = document.getElementById('newKeyBanner');
       const rawInput = document.getElementById('newKeyRawInput');
@@ -2931,7 +3826,7 @@ async function genApiKey(){
             ${escapeHtml(d.created_at)}
           </td>
           <td style="text-align:right">
-            <button type="button" class="app-btn app-btn-danger" style="padding:4px 10px;font-size:12px;display:inline-flex;align-items:center;gap:4px" onclick="revokeApiKey('${escapeHtml(d.key_id)}', '${escapeJsString(d.name)}')">
+            <button type="button" class="app-btn app-btn-danger" style="padding:4px 10px;font-size:12px;display:inline-flex;align-items:center;gap:4px" onclick="revokeApiKey('${escapeHtml(d.key_id)}', '${escapeJsString(d.name)}', this)">
               <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
               Revoke
             </button>
@@ -2946,39 +3841,44 @@ async function genApiKey(){
         countEl.textContent = cur + 1;
       }
     } else {
-      alert(d.error || 'Failed to generate API Key');
+      showToast((d && d.error) ? d.error : 'Failed to generate API Key', 'error');
     }
   } catch(e) {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `<svg style="width:16px;height:16px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/></svg> Generate Secret Key`;
-    }
-    alert('Network error while generating API Key.');
+    setButtonLoading(btn, false);
+    if (e.message !== 'Unauthenticated') showToast('Network error while generating API Key', 'error');
   }
 }
 
-async function revokeApiKey(keyId, keyName) {
-  if(!confirm(`Are you sure you want to revoke the API key "${keyName}"?\n\nAny application or integration using this key will immediately lose access.`)) {
-    return;
-  }
-  try {
-    const fd = new FormData(); fd.append('key_id', keyId);
-    const r = await fetch('?action=delete_api_key', {method:'POST', body:fd});
-    const d = await r.json();
-    if(d.ok) {
-      const row = document.getElementById('key-row-' + keyId);
-      if(row) row.remove();
-      const countEl = document.getElementById('apiKeyCount');
-      if (countEl) {
-        const cur = parseInt(countEl.textContent || '0', 10);
-        if (cur > 0) countEl.textContent = cur - 1;
+async function revokeApiKey(keyId, keyName, btnElement) {
+  showConfirmModal({
+    title: 'Revoke API Key?',
+    message: `Are you sure you want to revoke API key "${keyName}"? Applications using this key will immediately lose access.`,
+    confirmText: 'Revoke Key',
+    type: 'danger',
+    onConfirm: async () => {
+      if (btnElement) setButtonLoading(btnElement, true, 'Revoking...');
+      try {
+        const fd = new FormData(); fd.append('key_id', keyId);
+        const { data: d } = await authFetch('?action=delete_api_key', {method:'POST', body:fd});
+        if(d && d.ok) {
+          showToast(`API Key "${keyName}" revoked successfully`, 'success');
+          const row = document.getElementById('key-row-' + keyId);
+          if(row) row.remove();
+          const countEl = document.getElementById('apiKeyCount');
+          if (countEl) {
+            const cur = parseInt(countEl.textContent || '0', 10);
+            if (cur > 0) countEl.textContent = cur - 1;
+          }
+        } else {
+          showToast((d && d.error) ? d.error : 'Failed to revoke API key', 'error');
+        }
+      } catch(e) {
+        if (e.message !== 'Unauthenticated') showToast('Network error revoking API key', 'error');
+      } finally {
+        if (btnElement) setButtonLoading(btnElement, false);
       }
-    } else {
-      alert(d.error || 'Failed to revoke API key');
     }
-  } catch(e) {
-    alert('Network error revoking API key');
-  }
+  });
 }
 
 function copyNewApiKey(btn) {
@@ -3001,6 +3901,8 @@ function copyText(text, btnElement) {
     document.body.removeChild(textArea);
   }
 
+  showToast('Copied to clipboard!', 'info', 2000);
+
   if (btnElement) {
     const orig = btnElement.innerHTML;
     btnElement.innerHTML = `<svg style="width:14px;height:14px;color:#10b981" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"></path></svg> Copied!`;
@@ -3016,26 +3918,31 @@ function escapeJsString(str) {
 }
 
 async function checkForUpdates(silent = false) {
-  const badge = document.getElementById('updateBadge');
-  const card = document.getElementById('updateAvailableCard');
   const checkBtn = document.getElementById('btnCheckUpdates');
+  const latestVerDisplay = document.getElementById('latestVerDisplay');
+  const latestVerSub = document.getElementById('latestVerSub');
+  const detailsBox = document.getElementById('updateDetailsBox');
+  const titleEl = document.getElementById('updateReleaseTitle');
+  const dateEl = document.getElementById('updateReleaseDate');
+  const notesEl = document.getElementById('updateChangelogText');
+  const ghLink = document.getElementById('updateGithubLink');
   const sideVerBadge = document.getElementById('sidebarUpdateAvailableBadge');
   const sideMenuBadge = document.getElementById('sidebarUpdateBadge');
   
   if (checkBtn && !silent) {
-    checkBtn.disabled = true;
-    checkBtn.innerHTML = `<svg style="width:16px;height:16px;animation:spin 1s linear infinite" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"></circle><path d="M12 2a10 10 0 0 1 10 10" stroke-opacity="1"></path></svg> Checking...`;
+    setButtonLoading(checkBtn, true, 'Checking...');
   }
   
   try {
-    const res = await fetch('?action=check_updates');
-    const data = await res.json();
+    const { data } = await authFetch('?action=check_updates');
     if (checkBtn && !silent) {
-      checkBtn.disabled = false;
-      checkBtn.innerHTML = `<svg style="width:16px;height:16px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"></path><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> Check for Updates`;
+      setButtonLoading(checkBtn, false);
     }
     
-    if (data.ok) {
+    if (data && data.ok) {
+      if (latestVerDisplay) latestVerDisplay.textContent = data.latest_version;
+      if (latestVerSub) latestVerSub.textContent = data.published_at || 'GitHub release';
+
       if (data.has_update) {
         if (sideVerBadge) {
           sideVerBadge.style.display = 'inline-block';
@@ -3045,84 +3952,74 @@ async function checkForUpdates(silent = false) {
           sideMenuBadge.style.display = 'inline-block';
           sideMenuBadge.textContent = data.latest_version;
         }
-        if (badge) {
-          badge.textContent = 'Update Available: ' + data.latest_version;
-          badge.className = 'app-badge app-badge-amber';
+        if (detailsBox) {
+          detailsBox.style.display = 'block';
+          if (titleEl) titleEl.textContent = data.release_name || data.latest_version;
+          if (dateEl) dateEl.textContent = 'Published: ' + (data.published_at || 'Recent');
+          if (notesEl) notesEl.textContent = data.changelog || 'No release notes details provided.';
+          if (ghLink && data.html_url) ghLink.href = data.html_url;
         }
-        if (card) {
-          card.style.display = 'block';
-          const titleEl = document.getElementById('newVersionTitle');
-          const notesEl = document.getElementById('newVersionNotes');
-          if (titleEl) titleEl.textContent = 'Release: ' + (data.release_name || data.latest_version);
-          if (notesEl) notesEl.textContent = data.release_notes || 'No changelog provided.';
-          const dlBtn = document.getElementById('btnDownloadRelease');
-          if (dlBtn && data.download_url) {
-            dlBtn.href = data.download_url;
-            dlBtn.style.display = 'inline-flex';
-          }
-        }
+        showToast('New update available: ' + data.latest_version, 'warning');
       } else {
-        if (badge) {
-          badge.textContent = 'Up to Date (' + data.current_version + ')';
-          badge.className = 'app-badge app-badge-teal';
-        }
-        if (card) card.style.display = 'none';
+        if (detailsBox) detailsBox.style.display = 'none';
         if (sideVerBadge) sideVerBadge.style.display = 'none';
         if (sideMenuBadge) sideMenuBadge.style.display = 'none';
         if (!silent) {
-          alert('You are running the latest version of SMSLink (' + data.current_version + ')!');
+          showToast('You are running the latest version (' + data.current_version + ')!', 'success');
         }
       }
     } else {
-      if (!silent) alert('Failed to check updates: ' + (data.error || 'Unknown error'));
+      if (!silent) showToast('Failed to check updates: ' + ((data && data.error) ? data.error : 'Unknown error'), 'error');
     }
   } catch (err) {
-    if (checkBtn && !silent) {
-      checkBtn.disabled = false;
-      checkBtn.innerHTML = `<svg style="width:16px;height:16px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"></path><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> Check for Updates`;
-    }
-    if (!silent) alert('Connection error while querying updates');
+    if (checkBtn && !silent) setButtonLoading(checkBtn, false);
+    if (!silent && err.message !== 'Unauthenticated') showToast('Connection error checking updates', 'error');
   }
 }
 
 async function applySystemUpdate() {
-  if (!confirm('This will apply database schema migrations and update system structures. Continue?')) {
-    return;
-  }
-  const btn = document.getElementById('btnApplyUpdate');
-  const statusEl = document.getElementById('applyUpdateStatus');
-  if (btn) btn.disabled = true;
-  if (statusEl) {
-    statusEl.style.display = 'block';
-    statusEl.textContent = 'Migrating database tables & applying updates...';
-    statusEl.style.color = 'var(--app-primary)';
-  }
-  
-  try {
-    const res = await fetch('?action=apply_update', { method: 'POST' });
-    const data = await res.json();
-    if (data.ok) {
+  showConfirmModal({
+    title: 'Update System & Database?',
+    message: 'This will apply database schema migrations and update system structures to the latest build.',
+    confirmText: 'Update Now',
+    type: 'primary',
+    onConfirm: async () => {
+      const btn = document.getElementById('btnApplyUpdate');
+      const statusEl = document.getElementById('applyUpdateStatus');
+      if (btn) setButtonLoading(btn, true, 'Updating System...');
       if (statusEl) {
-        statusEl.textContent = data.message || 'System updated successfully!';
-        statusEl.style.color = '#10b981';
+        statusEl.style.display = 'block';
+        statusEl.textContent = 'Migrating database tables & applying updates...';
+        statusEl.style.color = 'var(--app-primary)';
       }
-      setTimeout(() => {
-        location.reload();
-      }, 1500);
-    } else {
-      if (statusEl) {
-        statusEl.textContent = 'Update failed: ' + (data.error || 'Unknown error');
-        statusEl.style.color = '#ef4444';
+      
+      try {
+        const { data } = await authFetch('?action=apply_update', { method: 'POST' });
+        if (data && data.ok) {
+          if (statusEl) {
+            statusEl.textContent = data.message || 'System updated successfully!';
+            statusEl.style.color = '#10b981';
+          }
+          showToast('System and database schema updated successfully!', 'success');
+          setTimeout(() => { location.reload(); }, 1200);
+        } else {
+          if (statusEl) {
+            statusEl.textContent = 'Update failed: ' + ((data && data.error) ? data.error : 'Unknown error');
+            statusEl.style.color = '#ef4444';
+          }
+          showToast((data && data.error) ? data.error : 'Update failed', 'error');
+          if (btn) setButtonLoading(btn, false);
+        }
+      } catch (err) {
+        if (statusEl) {
+          statusEl.textContent = 'Network error while applying update.';
+          statusEl.style.color = '#ef4444';
+        }
+        if (btn) setButtonLoading(btn, false);
+        if (err.message !== 'Unauthenticated') showToast('Network error applying update', 'error');
       }
-      if (btn) btn.disabled = false;
     }
-  } catch (err) {
-    if (statusEl) {
-      statusEl.textContent = 'Network error while applying update.';
-      statusEl.style.color = '#ef4444';
-    }
-    if (btn) btn.disabled = false;
-  }
+  });
 }
 </script>
 <?php endif; ?>
