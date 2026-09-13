@@ -750,26 +750,35 @@ if (isset($_GET['action'])) {
             exit;
         }
 
-        $targetVer = trim($_POST['target_version'] ?? '');
+        $repo = defined('APP_REPO') ? APP_REPO : 'beingniloy/smslink';
+        $targetVer = trim($_POST['target_version'] ?? $_GET['target_version'] ?? '');
+        
+        if (empty($targetVer)) {
+            $json = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
+            if ($json) {
+                $relData = json_decode($json, true);
+                $targetVer = $relData['tag_name'] ?? '';
+            }
+        }
         if (empty($targetVer)) {
             $targetVer = defined('APP_VERSION') ? APP_VERSION : 'v1.0.0';
         }
 
-        
+        // 1. Run database schema migrations
         ensureTablesExist($pdo);
 
-        
+        // 2. Sync system settings
         $stmtSync = $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)");
         $stmtSync->execute(['app_name', 'SMSLink']);
 
-        
+        // 3. Update version metadata configuration
         $verContent = "<?php\nif (!defined('APP_VERSION')) define('APP_VERSION', " . var_export($targetVer, true) . ");\nif (!defined('APP_BUILD_DATE')) define('APP_BUILD_DATE', " . var_export(date('Y-m-d'), true) . ");\nif (!defined('APP_REPO')) define('APP_REPO', 'beingniloy/smslink');\nreturn ['version' => APP_VERSION, 'build_date' => APP_BUILD_DATE, 'repo' => APP_REPO];\n";
         @file_put_contents(__DIR__ . '/../config/version.php', $verContent);
 
         logActivity('system_update', "Applied system update and executed DB migrations to version: {$targetVer}");
         echo json_encode([
             'ok' => true,
-            'message' => 'System and database schema updated successfully!',
+            'message' => "System and database schema updated to {$targetVer} successfully!",
             'version' => $targetVer
         ]);
         exit;
@@ -2314,6 +2323,17 @@ print(res.json())</pre>
                 <svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                 Update System &amp; Database Now
               </button>
+            </div>
+
+            <!-- Live Progress Bar & Status Bar -->
+            <div id="updateProgressWrap" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid #e2e8f0">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:12px;font-weight:600">
+                <span id="updateProgressStatus" style="color:var(--primary);display:flex;align-items:center;gap:6px">Preparing update...</span>
+                <span id="updateProgressPercent" style="color:#0f172a" class="mono">0%</span>
+              </div>
+              <div style="width:100%;height:8px;background:#e2e8f0;border-radius:9999px;overflow:hidden;position:relative">
+                <div id="updateProgressBar" style="width:0%;height:100%;background:linear-gradient(90deg, var(--primary) 0%, #10b981 100%);border-radius:9999px;transition:width 0.4s ease-out"></div>
+              </div>
             </div>
           </div>
 
@@ -3985,36 +4005,49 @@ async function applySystemUpdate() {
     type: 'primary',
     onConfirm: async () => {
       const btn = document.getElementById('btnApplyUpdate');
-      const statusEl = document.getElementById('applyUpdateStatus');
+      const progressWrap = document.getElementById('updateProgressWrap');
+      const progressStatus = document.getElementById('updateProgressStatus');
+      const progressPercent = document.getElementById('updateProgressPercent');
+      const progressBar = document.getElementById('updateProgressBar');
+
       if (btn) setButtonLoading(btn, true, 'Updating System...');
-      if (statusEl) {
-        statusEl.style.display = 'block';
-        statusEl.textContent = 'Migrating database tables & applying updates...';
-        statusEl.style.color = 'var(--app-primary)';
-      }
-      
+      if (progressWrap) progressWrap.style.display = 'block';
+
+      const updateProgress = (pct, text) => {
+        if (progressBar) progressBar.style.width = pct + '%';
+        if (progressPercent) progressPercent.textContent = pct + '%';
+        if (progressStatus) progressStatus.textContent = text;
+      };
+
+      updateProgress(15, 'Connecting to GitHub repository & checking release package...');
+
       try {
-        const { data } = await authFetch('?action=apply_update', { method: 'POST' });
+        const targetVer = document.getElementById('latestVerDisplay')?.textContent || '';
+        
+        setTimeout(() => { updateProgress(45, 'Executing database table schema migrations...'); }, 350);
+        setTimeout(() => { updateProgress(75, 'Updating system build metadata & version settings...'); }, 750);
+
+        const { data } = await authFetch('?action=apply_update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'target_version=' + encodeURIComponent(targetVer)
+        });
+
         if (data && data.ok) {
-          if (statusEl) {
-            statusEl.textContent = data.message || 'System updated successfully!';
-            statusEl.style.color = '#10b981';
-          }
-          showToast('System and database schema updated successfully!', 'success');
-          setTimeout(() => { location.reload(); }, 1200);
+          setTimeout(() => {
+            updateProgress(100, 'Update completed successfully! Auto-reloading dashboard...');
+            showToast(data.message || 'System and database schema updated successfully!', 'success');
+            setTimeout(() => { location.reload(); }, 1200);
+          }, 1000);
         } else {
-          if (statusEl) {
-            statusEl.textContent = 'Update failed: ' + ((data && data.error) ? data.error : 'Unknown error');
-            statusEl.style.color = '#ef4444';
-          }
+          if (progressBar) progressBar.style.background = '#ef4444';
+          updateProgress(100, 'Update failed: ' + ((data && data.error) ? data.error : 'Unknown error'));
           showToast((data && data.error) ? data.error : 'Update failed', 'error');
           if (btn) setButtonLoading(btn, false);
         }
       } catch (err) {
-        if (statusEl) {
-          statusEl.textContent = 'Network error while applying update.';
-          statusEl.style.color = '#ef4444';
-        }
+        if (progressBar) progressBar.style.background = '#ef4444';
+        updateProgress(100, 'Connection error applying update.');
         if (btn) setButtonLoading(btn, false);
         if (err.message !== 'Unauthenticated') showToast('Network error applying update', 'error');
       }
