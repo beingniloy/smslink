@@ -216,6 +216,77 @@ function renderSentMessagesTableRows($sentMessages) {
     return ob_get_clean();
 }
 
+function renderTeamTableRows($teamMembers, $currentUserRole, $currentUserId) {
+    ob_start();
+    foreach ($teamMembers as $tm): 
+      $isSelf = ((int)$tm['id'] === (int)($currentUserId ?? 0));
+      $isPending = (($tm['status'] ?? 'active') === 'pending');
+    ?>
+    <tr data-username="<?php echo strtolower(htmlspecialchars($tm['username'])); ?>" data-email="<?php echo strtolower(htmlspecialchars($tm['email'] ?? '')); ?>" id="member-row-<?php echo $tm['id']; ?>">
+      <td>
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="app-user-avatar" style="width:34px;height:34px;border-radius:50%;overflow:hidden;background:#334155;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0">
+            <?php if (!empty($tm['avatar_path'])): ?>
+            <img src="<?php echo htmlspecialchars($tm['avatar_path']); ?>" style="width:100%;height:100%;object-fit:cover">
+            <?php else: ?>
+            <?php echo strtoupper(substr($tm['username'], 0, 1)); ?>
+            <?php endif; ?>
+          </div>
+          <div>
+            <div style="font-weight:700;color:#0f172a;display:flex;align-items:center;gap:6px">
+              <?php echo htmlspecialchars($tm['username']); ?>
+              <?php if ($isSelf): ?>
+              <span style="font-size:10px;background:#e2e8f0;color:#475569;padding:1px 6px;border-radius:4px;font-weight:600">You</span>
+              <?php endif; ?>
+            </div>
+            <div style="font-size:11px;color:#64748b">ID: #<?php echo $tm['id']; ?></div>
+          </div>
+        </div>
+      </td>
+      <td>
+        <span class="mono" style="font-size:13px;color:#334155"><?php echo htmlspecialchars($tm['email'] ?: 'No email set'); ?></span>
+      </td>
+      <td>
+        <?php if (($tm['role'] ?? 'admin') === 'admin'): ?>
+        <span class="app-badge app-badge-green">Admin</span>
+        <?php else: ?>
+        <span class="app-badge app-badge-teal">Team Member</span>
+        <?php endif; ?>
+      </td>
+      <td>
+        <?php if ($isPending): ?>
+        <span class="app-badge app-badge-amber" id="status-badge-<?php echo $tm['id']; ?>">Pending</span>
+        <?php else: ?>
+        <span class="app-badge app-badge-green" id="status-badge-<?php echo $tm['id']; ?>">Active</span>
+        <?php endif; ?>
+      </td>
+      <td class="mono" style="font-size:12px;color:#64748b">
+        <?php echo date('M d, Y', strtotime($tm['created_at'])); ?>
+      </td>
+      <td style="text-align:right">
+        <div style="display:inline-flex;align-items:center;gap:6px">
+          <?php if ($currentUserRole === 'admin'): ?>
+          <button type="button" class="app-btn app-btn-secondary" style="padding:6px 12px;font-size:11px" onclick="openSetPasswordModal(<?php echo $tm['id']; ?>, '<?php echo htmlspecialchars($tm['username'], ENT_QUOTES); ?>')">
+            Set password
+          </button>
+          <?php if (!$isSelf && ($tm['role'] ?? '') !== 'admin'): ?>
+          <button type="button" class="app-btn app-btn-secondary" id="btn-status-<?php echo $tm['id']; ?>" style="padding:6px 10px;font-size:11px" onclick="toggleMemberStatus(<?php echo $tm['id']; ?>)">
+            <?php echo $isPending ? 'Activate' : 'Suspend'; ?>
+          </button>
+          <button type="button" class="app-btn app-btn-danger" style="padding:6px 10px;font-size:11px" onclick="deleteTeamMember(<?php echo $tm['id']; ?>, '<?php echo htmlspecialchars($tm['username'], ENT_QUOTES); ?>')">
+            Delete
+          </button>
+          <?php endif; ?>
+          <?php else: ?>
+          <span style="font-size:11px;color:#94a3b8">-</span>
+          <?php endif; ?>
+        </div>
+      </td>
+    </tr>
+    <?php endforeach;
+    return ob_get_clean();
+}
+
 if (isset($_GET['action'])) {
     header('Content-Type: application/json');
     if (!$isAuthed) {
@@ -223,6 +294,14 @@ if (isset($_GET['action'])) {
         exit;
     }
     $action = $_GET['action'];
+
+    if ($action === 'get_team_html') {
+        $stmtTeam = $pdo->query("SELECT * FROM users ORDER BY id ASC");
+        $teamMembers = $stmtTeam->fetchAll();
+        $html = renderTeamTableRows($teamMembers, $_SESSION['tf_role'] ?? 'admin', $_SESSION['tf_user_id'] ?? 0);
+        echo json_encode(['ok' => true, 'html' => $html]);
+        exit;
+    }
 
     if ($action === 'check_session') {
         echo json_encode([
@@ -504,7 +583,12 @@ if (isset($_GET['action'])) {
 
         $_SESSION['tf_username'] = $username;
         logActivity('profile_update', 'Admin updated profile/avatar: ' . $username);
-        echo json_encode(['ok' => true, 'message' => 'Profile updated successfully']);
+        echo json_encode([
+            'ok' => true,
+            'message' => 'Profile updated successfully',
+            'username' => $username,
+            'avatar_path' => $avatarPath
+        ]);
         exit;
     }
 
@@ -512,8 +596,6 @@ if (isset($_GET['action'])) {
         $appUrl  = trim($_POST['app_url'] ?? getAutoDetectedBaseUrl());
         $themeColor = trim($_POST['theme_color'] ?? '#057d77');
         $themeHover = trim($_POST['theme_color_hover'] ?? '#04635e');
-        $apkUrl = trim($_POST['app_apk_url'] ?? '');
-        $apkVer = trim($_POST['app_apk_version'] ?? '');
 
         $appUrl = rtrim($appUrl, '/');
 
@@ -522,12 +604,6 @@ if (isset($_GET['action'])) {
         $stmtSave->execute(['app_url', $appUrl]);
         $stmtSave->execute(['theme_color', $themeColor]);
         $stmtSave->execute(['theme_color_hover', $themeHover]);
-        if (!empty($apkUrl)) {
-            $stmtSave->execute(['app_apk_url', $apkUrl]);
-        }
-        if (!empty($apkVer)) {
-            $stmtSave->execute(['app_apk_version', $apkVer]);
-        }
 
         logActivity('settings_update', 'Admin updated system settings (Base URL: ' . $appUrl . ')');
         echo json_encode(['ok' => true, 'message' => 'Settings updated successfully!']);
@@ -890,11 +966,15 @@ if (isset($_GET['action'])) {
         }
 
         ensureTablesExist($pdo);
+        runDatabaseMigrations($pdo);
 
         $stmtSync = $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)");
         $stmtSync->execute(['app_name', 'SMSLink']);
 
-        $verContent = "<?php\nif (!defined('APP_VERSION')) define('APP_VERSION', " . var_export($targetVer, true) . ");\nif (!defined('APP_BUILD_DATE')) define('APP_BUILD_DATE', " . var_export(date('Y-m-d'), true) . ");\nif (!defined('APP_REPO')) define('APP_REPO', 'beingniloy/smslink');\nreturn ['version' => APP_VERSION, 'build_date' => APP_BUILD_DATE, 'repo' => APP_REPO];\n";
+        $apkUrlVal = defined('APP_APK_URL') ? APP_APK_URL : 'https://github.com/beingniloy/smslink/releases/download/v1.0.0/SMSLink-v1.0.0.apk';
+        $apkVerVal = defined('APP_APK_VERSION') ? APP_APK_VERSION : 'v1.0.0';
+
+        $verContent = "<?php\nif (!defined('APP_VERSION')) define('APP_VERSION', " . var_export($targetVer, true) . ");\nif (!defined('APP_BUILD_DATE')) define('APP_BUILD_DATE', " . var_export(date('Y-m-d'), true) . ");\nif (!defined('APP_REPO')) define('APP_REPO', 'beingniloy/smslink');\nif (!defined('APP_APK_URL')) define('APP_APK_URL', " . var_export($apkUrlVal, true) . ");\nif (!defined('APP_APK_VERSION')) define('APP_APK_VERSION', " . var_export($apkVerVal, true) . ");\n\nreturn ['version' => APP_VERSION, 'build_date' => APP_BUILD_DATE, 'repo' => APP_REPO, 'apk_url' => APP_APK_URL, 'apk_version' => APP_APK_VERSION];\n";
         @file_put_contents(__DIR__ . '/../config/version.php', $verContent);
 
         logActivity('system_update', "Applied system update from GitHub to version: {$targetVer} ({$filesUpdatedCount} files updated)");
@@ -1188,13 +1268,13 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   justify-content: center;
   border-radius: 50%;
 }
-.toast-success { border-left: 4px solid #10b981; }
+.toast-success { }
 .toast-success .toast-icon { background: #dcfce7; color: #10b981; }
-.toast-error { border-left: 4px solid #ef4444; }
+.toast-error { }
 .toast-error .toast-icon { background: #fee2e2; color: #ef4444; }
-.toast-warning { border-left: 4px solid #f59e0b; }
+.toast-warning { }
 .toast-warning .toast-icon { background: #fef3c7; color: #d97706; }
-.toast-info { border-left: 4px solid #0284c7; }
+.toast-info { }
 .toast-info .toast-icon { background: #e0f2fe; color: #0284c7; }
 .toast-close {
   margin-left: auto;
@@ -2417,19 +2497,6 @@ print(res.json())</pre>
               </div>
             </div>
 
-            <div class="app-form-grid" style="margin-top:4px">
-              <div class="app-form-group" style="margin-bottom:0">
-                <label class="app-label">Android Gateway APK Download URL</label>
-                <input type="url" name="app_apk_url" class="app-input" value="<?php echo htmlspecialchars($appApkUrl); ?>" placeholder="https://github.com/.../SMSLink-v1.0.0.apk">
-                <div style="font-size:11px;color:#64748b;margin-top:4px">Direct download URL for Gateway Android .APK release</div>
-              </div>
-
-              <div class="app-form-group" style="margin-bottom:0">
-                <label class="app-label">Android App Version Tag</label>
-                <input type="text" name="app_apk_version" class="app-input" value="<?php echo htmlspecialchars($appApkVersion); ?>" placeholder="v1.0.0">
-                <div style="font-size:11px;color:#64748b;margin-top:4px">Android app version (can be maintained independently)</div>
-              </div>
-            </div>
 
             <div style="display:flex;gap:12px;margin-top:6px">
               <button type="submit" class="app-btn app-btn-primary">Save Settings</button>
@@ -3374,6 +3441,16 @@ async function deleteTeamMember(userId, username){
   });
 }
 
+async function refreshTeamMembersList() {
+  try {
+    const { data } = await authFetch('?action=get_team_html');
+    if (data && data.ok && data.html) {
+      const tbody = document.querySelector('#teamTable tbody');
+      if (tbody) tbody.innerHTML = data.html;
+    }
+  } catch(e) {}
+}
+
 document.addEventListener('DOMContentLoaded', function(){
   const sForm = document.getElementById('settingsForm');
   if(sForm){
@@ -3391,7 +3468,6 @@ document.addEventListener('DOMContentLoaded', function(){
           const themeHov = document.getElementById('themeHoverInput')?.value;
           if(themeCol) document.documentElement.style.setProperty('--primary', themeCol);
           if(themeHov) document.documentElement.style.setProperty('--primary-hover', themeHov);
-          setTimeout(()=> window.location.reload(), 800);
         } else {
           showToast((d && d.error) ? d.error : 'Failed to update settings', 'error');
         }
@@ -3414,7 +3490,28 @@ document.addEventListener('DOMContentLoaded', function(){
         setButtonLoading(btn, false);
         if(d && d.ok){
           showToast(d.message || 'Profile updated successfully!', 'success');
-          setTimeout(()=>location.reload(), 1000);
+          if (d.username) {
+            const sideName = document.getElementById('sidebarUserName');
+            if (sideName) sideName.textContent = d.username;
+            const topName = document.getElementById('topbarUserName');
+            if (topName) topName.textContent = d.username;
+          }
+          if (d.avatar_path) {
+            const sideAv = document.getElementById('sidebarAvatarContainer');
+            if (sideAv) {
+              sideAv.innerHTML = `<img id="sidebarAvatarImg" src="${escapeHtml(d.avatar_path)}" style="width:100%;height:100%;object-fit:cover">`;
+            }
+            const topAv = document.getElementById('topbarAvatarContainer');
+            if (topAv) {
+              topAv.innerHTML = `<img id="topbarAvatarImg" src="${escapeHtml(d.avatar_path)}" alt="Avatar" style="width:100%;height:100%;object-fit:cover">`;
+            }
+          }
+          const currPass = document.getElementById('profileCurrentPassInput');
+          const newPass = document.getElementById('profileNewPassInput');
+          const confPass = document.getElementById('profileConfirmPassInput');
+          if (currPass) currPass.value = '';
+          if (newPass) newPass.value = '';
+          if (confPass) confPass.value = '';
         } else {
           showToast((d && d.error) ? d.error : 'Failed to update profile', 'error');
         }
@@ -3437,7 +3534,9 @@ document.addEventListener('DOMContentLoaded', function(){
         setButtonLoading(btn, false);
         if(d && d.ok){
           showToast(d.message || 'Team member created!', 'success');
-          setTimeout(() => { window.location.reload(); }, 1000);
+          closeAddMemberModal();
+          this.reset();
+          refreshTeamMembersList();
         } else {
           showToast((d && d.error) ? d.error : 'Failed to add member', 'error');
         }
@@ -4376,9 +4475,20 @@ async function applySystemUpdate() {
 
         if (data && data.ok) {
           setTimeout(() => {
-            updateProgress(100, 'Update completed successfully! Auto-reloading dashboard...');
+            updateProgress(100, 'Update completed successfully!');
             showToast(data.message || 'System and database schema updated successfully!', 'success');
-            setTimeout(() => { location.reload(); }, 1200);
+            const newVer = targetVer || 'v1.0.6';
+            const currDisplay = document.getElementById('currVerDisplay');
+            if (currDisplay) currDisplay.textContent = newVer;
+            const sideBrandVer = document.getElementById('sidebarBrandVersion');
+            if (sideBrandVer) sideBrandVer.textContent = newVer;
+            const sideBadge = document.getElementById('sidebarUpdateAvailableBadge');
+            if (sideBadge) sideBadge.style.display = 'none';
+            const sideMenuBadge = document.getElementById('sidebarUpdateBadge');
+            if (sideMenuBadge) sideMenuBadge.style.display = 'none';
+            const detailsBox = document.getElementById('updateDetailsBox');
+            if (detailsBox) detailsBox.style.display = 'none';
+            if (btn) setButtonLoading(btn, false);
           }, 1000);
         } else {
           if (progressBar) progressBar.style.background = '#ef4444';

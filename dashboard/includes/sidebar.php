@@ -80,22 +80,29 @@
     </div>
   </nav>
 
-  <div class="app-sidebar-footer">
-    <a onclick="showSection('profile')" class="app-user-profile-btn" title="View Account Profile">
-      <div class="app-user-avatar">
-        <?php if (!empty($adminAvatar)): ?>
-        <img src="<?php echo htmlspecialchars($adminAvatar); ?>" style="width:100%;height:100%;object-fit:cover">
-        <?php else: ?>
-        <?php echo strtoupper(substr($adminUser ?? 'A', 0, 1)); ?>
-        <?php endif; ?>
-      </div>
-      <div>
-        <div style="font-size:13px;font-weight:600;color:#0f172a"><?php echo htmlspecialchars($adminUser ?? 'Admin'); ?></div>
-        <div style="font-size:11px;color:#64748b">Profile Settings</div>
-      </div>
+  <div class="app-sidebar-footer" style="flex-direction:column;align-items:stretch;gap:0;padding:12px;border-top:1px solid var(--app-border-color)">
+    <a href="https://github.com/beingniloy/smslink" target="_blank" rel="noopener noreferrer" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;color:#0f172a;font-size:12px;font-weight:600;text-decoration:none;margin-bottom:10px;transition:all 0.15s;box-shadow:0 1px 2px rgba(0,0,0,0.02)" onmouseover="this.style.background='#f1f5f9';this.style.borderColor='#cbd5e1'" onmouseout="this.style.background='#f8fafc';this.style.borderColor='#e2e8f0'">
+      <svg style="width:14px;height:14px;color:#f59e0b;fill:#f59e0b" viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+      <span>Star Repo on GitHub</span>
     </a>
-    <a href="?logout=1" style="color:#64748b;padding:6px;border-radius:6px;display:flex;align-items:center;justify-content:center;transition:all 0.15s" onmouseover="this.style.color='#ef4444';this.style.background='#fef2f2'" onmouseout="this.style.color='#64748b';this.style.background='transparent'" title="Sign Out">
-      <svg style="width:18px;height:18px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
-    </a>
+
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;background:#ffffff;border:1px solid #e2e8f0;border-radius:10px;padding:8px 10px;transition:all 0.15s">
+      <a onclick="showSection('profile')" class="app-user-profile-btn" style="display:flex;align-items:center;gap:10px;text-decoration:none;cursor:pointer;flex:1;min-width:0;padding:0" title="View Account Profile">
+        <div class="app-user-avatar" id="sidebarAvatarContainer" style="width:34px;height:34px;border-radius:50%;background:var(--primary);color:#ffffff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0;overflow:hidden;box-shadow:0 0 0 2px var(--primary-light)">
+          <?php if (!empty($adminAvatar)): ?>
+          <img id="sidebarAvatarImg" src="<?php echo htmlspecialchars($adminAvatar); ?>" style="width:100%;height:100%;object-fit:cover">
+          <?php else: ?>
+          <span id="sidebarAvatarInitials"><?php echo strtoupper(substr($adminUser ?? 'A', 0, 1)); ?></span>
+          <?php endif; ?>
+        </div>
+        <div style="min-width:0;flex:1">
+          <div id="sidebarUserName" style="font-size:13px;font-weight:700;color:#0f172a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?php echo htmlspecialchars($adminUser ?? 'Admin'); ?></div>
+          <div style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Profile Settings</div>
+        </div>
+      </a>
+      <a href="?logout=1" style="color:#64748b;width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.15s" onmouseover="this.style.color='#ef4444';this.style.background='#fef2f2'" onmouseout="this.style.color='#64748b';this.style.background='transparent'" title="Sign Out">
+        <svg style="width:17px;height:17px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+      </a>
+    </div>
   </div>
 </aside>

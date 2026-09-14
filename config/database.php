@@ -172,6 +172,13 @@ function ensureTablesExist($pdo) {
       `setting_value` TEXT NULL,
       `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    CREATE TABLE IF NOT EXISTS `schema_migrations` (
+      `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      `migration` VARCHAR(255) NOT NULL UNIQUE,
+      `batch` INT UNSIGNED NOT NULL DEFAULT 1,
+      `executed_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ";
 
     $pdo->exec($sql);
@@ -200,6 +207,9 @@ function ensureTablesExist($pdo) {
         }
     } catch (Exception $e) {}
 
+    // Run file-based migrations if present
+    runDatabaseMigrations($pdo);
+
     // Insert and sync canonical settings
     try {
         $count = $pdo->query("SELECT COUNT(*) FROM system_settings")->fetchColumn();
@@ -209,6 +219,53 @@ function ensureTablesExist($pdo) {
             $stmtInit->execute([$autoUrl]);
         } else {
             $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES ('app_name', 'SMSLink') ON DUPLICATE KEY UPDATE setting_value = 'SMSLink'")->execute();
+        }
+    } catch (Exception $e) {}
+}
+
+function runDatabaseMigrations($pdo) {
+    try {
+        $migrationDirs = [
+            __DIR__ . '/../database/migrations',
+            __DIR__ . '/../migrations'
+        ];
+
+        $migrationFiles = [];
+        foreach ($migrationDirs as $dir) {
+            if (is_dir($dir)) {
+                $files = glob($dir . '/*.sql');
+                if ($files) {
+                    sort($files);
+                    foreach ($files as $f) {
+                        $migrationFiles[] = $f;
+                    }
+                }
+            }
+        }
+
+        if (empty($migrationFiles)) return;
+
+        $executed = [];
+        try {
+            $executed = $pdo->query("SELECT migration FROM schema_migrations")->fetchAll(PDO::FETCH_COLUMN);
+        } catch (Exception $e) {}
+
+        foreach ($migrationFiles as $file) {
+            $baseName = basename($file);
+            if (in_array($baseName, $executed)) continue;
+
+            $sqlContent = file_get_contents($file);
+            if (!empty(trim($sqlContent))) {
+                $queries = array_filter(array_map('trim', explode(';', $sqlContent)));
+                foreach ($queries as $q) {
+                    if (!empty($q)) {
+                        $pdo->exec($q);
+                    }
+                }
+            }
+
+            $stmtIns = $pdo->prepare("INSERT INTO schema_migrations (migration, executed_at) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE executed_at = NOW()");
+            $stmtIns->execute([$baseName]);
         }
     } catch (Exception $e) {}
 }
@@ -251,9 +308,8 @@ function getSystemSettings($pdo) {
             if (empty($settings['app_url'])) {
                 $settings['app_url'] = getAutoDetectedBaseUrl();
             }
-            if (empty($settings['app_apk_url'])) {
-                $settings['app_apk_url'] = $apkUrl;
-            }
+            $settings['app_apk_url'] = $apkUrl;
+            $settings['app_apk_version'] = $apkVer;
             return $settings;
         }
     } catch (Exception $e) {}

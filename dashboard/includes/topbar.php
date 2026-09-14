@@ -24,7 +24,7 @@
 
     <!-- Actions Group -->
     <div class="app-topbar-actions" id="topbarActions">
-      <a href="<?php echo htmlspecialchars($appApkUrl ?? 'https://github.com/beingniloy/smslink/releases/download/v1.0.0/SMSLink-v1.0.0.apk'); ?>" target="_blank" rel="noopener noreferrer" class="app-btn app-topbar-apk-btn" title="Download Android Gateway App (.APK)" download>
+      <a href="<?php echo htmlspecialchars(defined('APP_APK_URL') ? APP_APK_URL : ($appApkUrl ?? 'https://github.com/beingniloy/smslink/releases/download/v1.0.0/SMSLink-v1.0.0.apk')); ?>" target="_blank" rel="noopener noreferrer" class="app-btn app-topbar-apk-btn" title="Download Android Gateway App (.APK)" download>
         <svg style="width:14px;height:14px" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
         <span>Download App</span>
       </a>
@@ -35,14 +35,14 @@
       </a>
 
       <a onclick="showSection('profile')" class="app-topbar-user-btn" title="Account Profile">
-        <div class="app-user-avatar">
+        <div class="app-user-avatar" id="topbarAvatarContainer">
           <?php if (!empty($adminAvatar)): ?>
-          <img src="<?php echo htmlspecialchars($adminAvatar); ?>" alt="Avatar">
+          <img id="topbarAvatarImg" src="<?php echo htmlspecialchars($adminAvatar); ?>" alt="Avatar">
           <?php else: ?>
-          <?php echo strtoupper(substr($adminUser ?? 'A', 0, 1)); ?>
+          <span id="topbarAvatarInitials"><?php echo strtoupper(substr($adminUser ?? 'A', 0, 1)); ?></span>
           <?php endif; ?>
         </div>
-        <span class="app-topbar-user-name"><?php echo htmlspecialchars($adminUser ?? 'Admin'); ?></span>
+        <span class="app-topbar-user-name" id="topbarUserName"><?php echo htmlspecialchars($adminUser ?? 'Admin'); ?></span>
       </a>
     </div>
   </div>
