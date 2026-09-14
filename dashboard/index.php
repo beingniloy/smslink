@@ -904,6 +904,7 @@ $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim(
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
 <script src="assets/js/qrcode.min.js?v=<?php echo defined('APP_VERSION') ? APP_VERSION : time(); ?>"></script>
 <style>
 :root {
@@ -2319,7 +2320,7 @@ print(res.json())</pre>
 
             <div style="margin-bottom:14px">
               <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#475569;margin-bottom:6px;letter-spacing:0.04em">Release Notes &amp; Changelog</div>
-              <div id="updateChangelogText" style="background:#FFF;border:1px solid #e2e8f0;padding:12px;border-radius:8px;font-size:13px;color:#334155;max-height:160px;overflow-y:auto;white-space:pre-wrap;font-family:sans-serif"></div>
+              <div id="updateChangelogText" style="background:#FFF;border:1px solid #e2e8f0;padding:14px 16px;border-radius:10px;font-size:13px;color:#334155;max-height:260px;overflow-y:auto;line-height:1.6;font-family:sans-serif"></div>
             </div>
 
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:10px;border-top:1px solid #e2e8f0">
@@ -3956,6 +3957,27 @@ function escapeJsString(str) {
   return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+function renderMarkdown(text) {
+  if (!text) return '';
+  if (window.marked && typeof window.marked.parse === 'function') {
+    try {
+      return window.marked.parse(text);
+    } catch (e) {}
+  }
+  let html = escapeHtml(text);
+  html = html.replace(/```([\s\S]*?)```/g, '<pre style="background:#f1f5f9;padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:12px;margin:8px 0"><code>$1</code></pre>');
+  html = html.replace(/`([^`]+)`/g, '<code style="background:#f1f5f9;color:#0f172a;padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px">$1</code>');
+  html = html.replace(/^### (.*$)/gim, '<h5 style="font-size:14px;font-weight:700;color:#0f172a;margin:12px 0 6px">$1</h5>');
+  html = html.replace(/^## (.*$)/gim, '<h4 style="font-size:15px;font-weight:700;color:#0f172a;margin:14px 0 6px">$1</h4>');
+  html = html.replace(/^# (.*$)/gim, '<h3 style="font-size:16px;font-weight:800;color:#0f172a;margin:16px 0 8px">$1</h3>');
+  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--primary);text-decoration:none;font-weight:600">$1 ↗</a>');
+  html = html.replace(/^\s*[-*]\s+(.*$)/gim, '<li style="margin-left:20px;margin-bottom:4px;list-style-type:disc">$1</li>');
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
 async function checkForUpdates(silent = false) {
   const checkBtn = document.getElementById('btnCheckUpdates');
   const latestVerDisplay = document.getElementById('latestVerDisplay');
@@ -3995,7 +4017,7 @@ async function checkForUpdates(silent = false) {
           detailsBox.style.display = 'block';
           if (titleEl) titleEl.textContent = data.release_name || data.latest_version;
           if (dateEl) dateEl.textContent = 'Published: ' + (data.published_at || 'Recent');
-          if (notesEl) notesEl.textContent = data.changelog || 'No release notes details provided.';
+          if (notesEl) notesEl.innerHTML = renderMarkdown(data.changelog || 'No release notes details provided.');
           if (ghLink && data.html_url) ghLink.href = data.html_url;
         }
         showToast('New update available: ' + data.latest_version, 'warning');
