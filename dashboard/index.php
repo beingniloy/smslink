@@ -904,7 +904,7 @@ $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim(
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="assets/js/qrcode.min.js"></script>
+<script src="assets/js/qrcode.min.js?v=<?php echo defined('APP_VERSION') ? APP_VERSION : time(); ?>"></script>
 <style>
 :root {
   --primary:<?php echo htmlspecialchars($themeColor); ?>;
