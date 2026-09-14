@@ -97,6 +97,20 @@ if (isset($_GET['login']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $isAuthed = !empty($_SESSION['tf_auth']);
 
+if (!$isAuthed) {
+    $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH) ?? '';
+    $requestPath = rtrim($requestPath, '/');
+    $pathParts = explode('/', $requestPath);
+    $lastSegment = strtolower(end($pathParts));
+    $subSections = ['send', 'sent', 'devices', 'apikeys', 'docs', 'team', 'settings', 'updates', 'about', 'profile'];
+    if (in_array($lastSegment, $subSections)) {
+        $scriptDir = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/dashboard/index.php'), '/\\');
+        $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim($scriptDir, '/') . '/dashboard';
+        header('Location: ' . ($dashBaseUrl ?: '/dashboard') . '/');
+        exit;
+    }
+}
+
 function renderDevicesSectionContent($devices, $simsByDevice) {
     ob_start();
     ?>
@@ -1525,8 +1539,54 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   .app-page-title{font-size:14px;max-width:100px}
 }
 </style>
-</head>
-<body>
+<script>
+if (typeof escapeHtml !== 'function') {
+  window.escapeHtml = function(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  };
+}
+
+if (typeof getDashboardBasePath !== 'function') {
+  window.getDashboardBasePath = function() {
+    let path = window.location.pathname;
+    const validSections = ['status', 'send', 'sent', 'devices', 'apikeys', 'docs', 'team', 'settings', 'updates', 'about', 'profile'];
+    validSections.forEach(sec => {
+      const reg = new RegExp('/' + sec + '/?$', 'i');
+      path = path.replace(reg, '/');
+    });
+    path = path.replace(/\/index\.php\/?$/i, '/');
+    if (!path.endsWith('/')) path += '/';
+    return path;
+  };
+}
+
+if (typeof setButtonLoading !== 'function') {
+  window.setButtonLoading = function(btn, isLoading, loadingText = '') {
+    if (!btn) return;
+    if (isLoading) {
+      if (!btn.dataset.origHtml) btn.dataset.origHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.classList.add('btn-loading');
+      const text = loadingText || 'Processing...';
+      btn.innerHTML = `<span class="btn-spinner"></span> <span>${escapeHtml(text)}</span>`;
+    } else {
+      btn.disabled = false;
+      btn.classList.remove('btn-loading');
+      if (btn.dataset.origHtml) {
+        btn.innerHTML = btn.dataset.origHtml;
+        delete btn.dataset.origHtml;
+      }
+    }
+  };
+}
+</script>
+
 <div id="toastContainer"></div>
 
 <?php if (!$isAuthed): ?>
@@ -1584,7 +1644,8 @@ document.getElementById('loginForm')?.addEventListener('submit', function(e){
 
   if (btn) setButtonLoading(btn, true, 'Signing in...');
 
-  fetch('?login=1', {method:'POST', body:fd}).then(r=>r.json()).then(d=>{
+  const targetLoginUrl = (typeof getDashboardBasePath === 'function') ? (getDashboardBasePath() + '?login=1') : '?login=1';
+  fetch(targetLoginUrl, {method:'POST', body:fd}).then(r=>r.json()).then(d=>{
     if(d.ok) {
       try {
         if (remember && username) {
@@ -1593,7 +1654,8 @@ document.getElementById('loginForm')?.addEventListener('submit', function(e){
           localStorage.removeItem('smslink_saved_username');
         }
       } catch(e) {}
-      location.reload();
+      const targetDashUrl = (typeof getDashboardBasePath === 'function') ? getDashboardBasePath() : './';
+      window.location.href = targetDashUrl;
     } else {
       if (btn) setButtonLoading(btn, false);
       err.textContent = d.error || 'Invalid credentials';
@@ -2941,10 +3003,11 @@ async function authFetch(url, options = {}) {
 function handleLoggedOutState() {
   if (window._isLoggedOutHandled) return;
   window._isLoggedOutHandled = true;
-  showToast('Session expired. Please sign in again.', 'warning', 4000);
+  showToast('Session expired. Redirecting to sign in...', 'warning', 3000);
   setTimeout(() => {
-    window.location.reload();
-  }, 1000);
+    const targetUrl = (typeof getDashboardBasePath === 'function') ? getDashboardBasePath() : './';
+    window.location.href = targetUrl;
+  }, 800);
 }
 
 async function syncDevicesState() {
