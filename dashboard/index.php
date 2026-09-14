@@ -904,6 +904,7 @@ $dashBaseUrl = (strpos($scriptDir, 'dashboard') !== false) ? $scriptDir : rtrim(
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="assets/js/qrcode.min.js"></script>
 <style>
 :root {
   --primary:<?php echo htmlspecialchars($themeColor); ?>;
@@ -1010,6 +1011,10 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
   border-top-color: transparent;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }
 
 /* Modern Toast Notification System */
@@ -1665,7 +1670,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
           </div>
         </div>
 
-        <div class="app-card">
+        <div class="app-card" id="devicesListCard">
           <?php echo renderDevicesSectionContent($devices, $simsByDevice); ?>
         </div>
       </div>
@@ -2497,6 +2502,8 @@ print(res.json())</pre>
       <div style="font-size:13px;color:#64748b;text-align:center">Generating QR Code...</div>
     </div>
 
+    <div id="pairingCodeLabel" style="display:none;font-family:'Fira Code',monospace;font-weight:700;font-size:13.5px;letter-spacing:1px;color:#0369a1;background:#f0f9ff;padding:10px 16px;border-radius:10px;margin:0 auto 16px;text-align:center;border:1px solid #bae6fd"></div>
+
     <div style="font-size:12px;color:#64748b;margin-bottom:14px;text-align:center">
       Don't have the Gateway Android App yet? <a href="<?php echo htmlspecialchars($appApkUrl); ?>" target="_blank" download style="color:var(--primary);font-weight:600;text-decoration:none">Download .APK (<?php echo htmlspecialchars($appApkVersion); ?>) ↗</a>
     </div>
@@ -2586,7 +2593,6 @@ print(res.json())</pre>
 <script>
 const validSections = ['status', 'send', 'sent', 'devices', 'apikeys', 'docs', 'team', 'settings', 'updates', 'about', 'profile'];
 
-// --- TOAST NOTIFICATIONS ---
 function showToast(message, type = 'success', duration = 3500) {
   let container = document.getElementById('toastContainer');
   if (!container) {
@@ -2625,7 +2631,6 @@ function showToast(message, type = 'success', duration = 3500) {
   }
 }
 
-// --- BUTTON LOADER HELPER ---
 function setButtonLoading(btn, isLoading, loadingText = '') {
   if (!btn) return;
   if (isLoading) {
@@ -2644,7 +2649,6 @@ function setButtonLoading(btn, isLoading, loadingText = '') {
   }
 }
 
-// --- CONFIRMATION MODAL HELPER ---
 function showConfirmModal({ title = 'Are you sure?', message = 'This action cannot be undone.', confirmText = 'Confirm', type = 'danger', onConfirm }) {
   const modal = document.getElementById('confirmModal');
   const titleEl = document.getElementById('confirmModalTitle');
@@ -2677,7 +2681,6 @@ function showConfirmModal({ title = 'Are you sure?', message = 'This action cann
   };
 }
 
-// --- AUTH FETCH INTERCEPTOR FOR INSTANT LOGOUT DETECTION ---
 async function authFetch(url, options = {}) {
   try {
     const res = await fetch(url, options);
@@ -2709,7 +2712,6 @@ function handleLoggedOutState() {
   }, 1000);
 }
 
-// --- DYNAMIC DEVICE RE-SYNCING (REACT-LIKE REFRESH) ---
 async function syncDevicesState() {
   try {
     const { data } = await authFetch('?action=get_devices_json');
@@ -3340,23 +3342,20 @@ async function openQrModal(){
       <div style="font-size:13px;color:#64748b;font-weight:500">Generating Secure QR Code...</div>
     </div>
   `;
-  label.style.display = 'none';
-  label.textContent = '';
+  if (label) {
+    label.style.display = 'none';
+    label.textContent = '';
+  }
   
   if (pairingCheckTimer) { clearInterval(pairingCheckTimer); pairingCheckTimer = null; }
 
   try {
-    const r = await fetch('?action=generate_pairing_qr', {method:'POST'});
-    const d = await r.json();
-    if(d.ok){
-      const qrData = encodeURIComponent(d.qr_data);
-      const primaryQr = `https://quickchart.io/qr?size=200&text=${qrData}`;
-      const fallbackQr = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${qrData}`;
-      
+    const { data: d } = await authFetch('?action=generate_pairing_qr', {method:'POST'});
+    if(d && d.ok){
       container.innerHTML = `
         <div style="text-align:center">
           <div style="position:relative;display:inline-block;padding:12px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;box-shadow:0 4px 20px rgba(0,0,0,0.04);margin-bottom:14px">
-            <img src="${primaryQr}" onerror="this.onerror=null;this.src='${fallbackQr}';" width="190" height="190" alt="Pairing QR" style="border-radius:10px;display:block">
+            <div id="qrCanvasWrap" style="width:190px;height:190px;display:flex;align-items:center;justify-content:center"></div>
           </div>
           <div id="qrStatusBanner" style="font-size:12.5px;font-weight:500;color:#0369a1;background:#f0f9ff;border:1px solid #bae6fd;padding:8px 16px;border-radius:20px;display:inline-flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 1px 3px rgba(0,0,0,0.02)">
             <span class="qr-status-spinner"></span>
@@ -3364,17 +3363,36 @@ async function openQrModal(){
           </div>
         </div>
       `;
-      label.style.display = 'block';
-      label.textContent = 'PAIRING CODE: ' + d.pairing_code;
+
+      const qrCanvasWrap = document.getElementById('qrCanvasWrap');
+      if (window.QRCode && qrCanvasWrap) {
+        new QRCode(qrCanvasWrap, {
+          text: d.qr_data,
+          width: 190,
+          height: 190,
+          colorDark: "#0f172a",
+          colorLight: "#ffffff",
+          correctLevel: QRCode.CorrectLevel.M
+        });
+      } else if (qrCanvasWrap) {
+        const qrData = encodeURIComponent(d.qr_data);
+        const primaryQr = `https://quickchart.io/qr?size=200&text=${qrData}`;
+        const fallbackQr = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${qrData}`;
+        qrCanvasWrap.innerHTML = `<img src="${primaryQr}" onerror="this.onerror=null;this.src='${fallbackQr}';" width="190" height="190" alt="Pairing QR" style="border-radius:10px;display:block">`;
+      }
+
+      if (label) {
+        label.style.display = 'block';
+        label.textContent = 'PAIRING CODE: ' + d.pairing_code;
+      }
 
       const token = d.token;
       const code = d.pairing_code;
 
       pairingCheckTimer = setInterval(async () => {
         try {
-          const res = await fetch(`?action=check_pairing_status&token=${encodeURIComponent(token)}&pairing_code=${encodeURIComponent(code)}`);
-          const statusData = await res.json();
-          if (statusData.ok && statusData.paired) {
+          const { data: statusData } = await authFetch(`?action=check_pairing_status&token=${encodeURIComponent(token)}&pairing_code=${encodeURIComponent(code)}`);
+          if (statusData && statusData.ok && statusData.paired) {
             clearInterval(pairingCheckTimer);
             pairingCheckTimer = null;
 
@@ -3387,13 +3405,13 @@ async function openQrModal(){
                   </svg>
                 </div>
                 <div class="qr-success-title">Device Connected Successfully</div>
-                <div class="qr-success-sub"><strong>${statusData.device_name || 'Android Gateway'}</strong> is active &amp; online</div>
+                <div class="qr-success-sub"><strong>${escapeHtml(statusData.device_name || 'Android Gateway')}</strong> is active &amp; online</div>
                 <div class="qr-success-pill">
                   <span class="qr-pulse-dot"></span> Online &bull; Closing in 3 seconds
                 </div>
               </div>
             `;
-            label.style.display = 'none';
+            if (label) label.style.display = 'none';
 
             refreshDeviceList();
 
@@ -3408,7 +3426,9 @@ async function openQrModal(){
       container.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Failed to generate QR code</div>';
     }
   } catch(e) {
-    container.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Network error generating QR code</div>';
+    if (e.message !== 'Unauthenticated') {
+      container.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Network error generating QR code</div>';
+    }
   }
 }
 
@@ -3436,10 +3456,9 @@ async function refreshSentMessagesList() {
 
 async function refreshDeviceList() {
   try {
-    const res = await fetch('?action=get_devices_html');
-    const data = await res.json();
-    if (data.ok && data.html) {
-      const card = document.querySelector('#section-devices .app-card');
+    const { data } = await authFetch('?action=get_devices_html');
+    if (data && data.ok && data.html) {
+      const card = document.getElementById('devicesListCard');
       if (card && card.innerHTML !== data.html) {
         card.innerHTML = data.html;
       }
