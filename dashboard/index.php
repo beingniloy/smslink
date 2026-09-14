@@ -287,6 +287,36 @@ function renderTeamTableRows($teamMembers, $currentUserRole, $currentUserId) {
     return ob_get_clean();
 }
 
+function fetchGithubUrlContent($url) {
+    if (function_exists('curl_init')) {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'SMSLink-Updater');
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/vnd.github.v3+json']);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 12);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        $res = curl_exec($ch);
+        curl_close($ch);
+        if (!empty($res)) return $res;
+    }
+    $opts = [
+        'http' => [
+            'method' => 'GET',
+            'header' => "User-Agent: SMSLink-Updater\r\nAccept: application/vnd.github.v3+json\r\n",
+            'timeout' => 12
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false
+        ]
+    ];
+    $ctx = stream_context_create($opts);
+    return @file_get_contents($url, false, $ctx);
+}
+
 if (isset($_GET['action'])) {
     header('Content-Type: application/json');
     if (!$isAuthed) {
@@ -738,38 +768,8 @@ if (isset($_GET['action'])) {
         $changelog = null;
         $htmlUrl = "https://github.com/{$repo}/releases";
 
-        $fetchGithubUrl = function($url) {
-            if (function_exists('curl_init')) {
-                $ch = curl_init();
-                curl_setopt($ch, CURLOPT_URL, $url);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_USERAGENT, 'SMSLink-Updater');
-                curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/vnd.github.v3+json']);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 8);
-                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-                $res = curl_exec($ch);
-                curl_close($ch);
-                if (!empty($res)) return $res;
-            }
-            $opts = [
-                'http' => [
-                    'method' => 'GET',
-                    'header' => "User-Agent: SMSLink-Updater\r\nAccept: application/vnd.github.v3+json\r\n",
-                    'timeout' => 8
-                ],
-                'ssl' => [
-                    'verify_peer' => false,
-                    'verify_peer_name' => false
-                ]
-            ];
-            $ctx = stream_context_create($opts);
-            return @file_get_contents($url, false, $ctx);
-        };
-
         // 1. Try fetching latest official release from GitHub API
-        $json = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
+        $json = fetchGithubUrlContent("https://api.github.com/repos/{$repo}/releases/latest");
         if ($json) {
             $data = json_decode($json, true);
             if (!empty($data['tag_name'])) {
@@ -783,7 +783,7 @@ if (isset($_GET['action'])) {
 
         // 2. Fallback to repository tags if releases array is empty
         if (!$latestTag) {
-            $tagsJson = $fetchGithubUrl("https://api.github.com/repos/{$repo}/tags");
+            $tagsJson = fetchGithubUrlContent("https://api.github.com/repos/{$repo}/tags");
             if ($tagsJson) {
                 $tagsData = json_decode($tagsJson, true);
                 if (!empty($tagsData) && isset($tagsData[0]['name'])) {
@@ -829,7 +829,7 @@ if (isset($_GET['action'])) {
         $repo = defined('APP_REPO') ? APP_REPO : 'beingniloy/smslink';
         $targetVer = trim($_POST['target_version'] ?? $_GET['target_version'] ?? '');
         
-        $relJson = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
+        $relJson = fetchGithubUrlContent("https://api.github.com/repos/{$repo}/releases/latest");
         $zipUrl = null;
         if ($relJson) {
             $relData = json_decode($relJson, true);
