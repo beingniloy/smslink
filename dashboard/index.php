@@ -753,33 +753,158 @@ if (isset($_GET['action'])) {
         $repo = defined('APP_REPO') ? APP_REPO : 'beingniloy/smslink';
         $targetVer = trim($_POST['target_version'] ?? $_GET['target_version'] ?? '');
         
-        if (empty($targetVer)) {
-            $json = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
-            if ($json) {
-                $relData = json_decode($json, true);
+        $relJson = $fetchGithubUrl("https://api.github.com/repos/{$repo}/releases/latest");
+        $zipUrl = null;
+        if ($relJson) {
+            $relData = json_decode($relJson, true);
+            if (empty($targetVer)) {
                 $targetVer = $relData['tag_name'] ?? '';
             }
+            $zipUrl = $relData['zipball_url'] ?? null;
         }
         if (empty($targetVer)) {
             $targetVer = defined('APP_VERSION') ? APP_VERSION : 'v1.0.0';
         }
+        if (empty($zipUrl)) {
+            $zipUrl = "https://github.com/{$repo}/archive/refs/tags/{$targetVer}.zip";
+        }
 
-        // 1. Run database schema migrations
+        $filesUpdatedCount = 0;
+        $downloadSuccess = false;
+
+        $tmpDir = sys_get_temp_dir() . '/smslink_upd_' . uniqid();
+        $zipFile = $tmpDir . '/release.zip';
+        if (!is_dir($tmpDir)) {
+            @mkdir($tmpDir, 0777, true);
+        }
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($zipUrl);
+            $fp = fopen($zipFile, 'wb');
+            curl_setopt($ch, CURLOPT_FILE, $fp);
+            curl_setopt($ch, CURLOPT_HEADER, 0);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 90);
+            curl_setopt($ch, CURLOPT_USERAGENT, 'SMSLink-AutoUpdater/1.0');
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            $res = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            fclose($fp);
+            if ($res && $httpCode >= 200 && $httpCode < 300 && file_exists($zipFile) && filesize($zipFile) > 100) {
+                $downloadSuccess = true;
+            }
+        }
+
+        if (!$downloadSuccess) {
+            $opts = [
+                'http' => [
+                    'method' => 'GET',
+                    'header' => "User-Agent: SMSLink-AutoUpdater/1.0\r\n",
+                    'follow_location' => 1,
+                    'timeout' => 90
+                ],
+                'ssl' => [
+                    'verify_peer' => false,
+                    'verify_peer_name' => false
+                ]
+            ];
+            $context = stream_context_create($opts);
+            $content = @file_get_contents($zipUrl, false, $context);
+            if ($content && strlen($content) > 100) {
+                file_put_contents($zipFile, $content);
+                $downloadSuccess = true;
+            }
+        }
+
+        if ($downloadSuccess && class_exists('ZipArchive')) {
+            $zip = new ZipArchive();
+            if ($zip->open($zipFile) === true) {
+                $extractDir = $tmpDir . '/extracted';
+                $zip->extractTo($extractDir);
+                $zip->close();
+
+                $subDirs = glob($extractDir . '/*', GLOB_ONLYDIR);
+                $sourceRoot = (!empty($subDirs)) ? $subDirs[0] : $extractDir;
+                $projectRoot = realpath(__DIR__ . '/..');
+                
+                $excludedPaths = [
+                    'config/db_credentials.php',
+                    'config/installed.lock',
+                    'config/admin.json',
+                    'dashboard/uploads',
+                    'uploads',
+                    '.env',
+                    '.git'
+                ];
+
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($sourceRoot, RecursiveDirectoryIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::SELF_FIRST
+                );
+
+                foreach ($iterator as $item) {
+                    $relPath = str_replace('\\', '/', substr($item->getPathname(), strlen($sourceRoot) + 1));
+                    if (empty($relPath)) continue;
+
+                    $isExcluded = false;
+                    foreach ($excludedPaths as $ex) {
+                        if ($relPath === $ex || strpos($relPath, $ex . '/') === 0) {
+                            $isExcluded = true;
+                            break;
+                        }
+                    }
+                    if ($isExcluded) continue;
+
+                    $targetPath = $projectRoot . '/' . $relPath;
+                    if ($item->isDir()) {
+                        if (!is_dir($targetPath)) {
+                            @mkdir($targetPath, 0777, true);
+                        }
+                    } else {
+                        $targetDir = dirname($targetPath);
+                        if (!is_dir($targetDir)) {
+                            @mkdir($targetDir, 0777, true);
+                        }
+                        if (@copy($item->getPathname(), $targetPath)) {
+                            $filesUpdatedCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        @unlink($zipFile);
+        if (is_dir($tmpDir)) {
+            try {
+                $files = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::CHILD_FIRST
+                );
+                foreach ($files as $fileinfo) {
+                    $todo = ($fileinfo->isDir() ? 'rmdir' : 'unlink');
+                    @$todo($fileinfo->getRealPath());
+                }
+                @rmdir($tmpDir);
+            } catch (Exception $e) {}
+        }
+
         ensureTablesExist($pdo);
 
-        // 2. Sync system settings
         $stmtSync = $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)");
         $stmtSync->execute(['app_name', 'SMSLink']);
 
-        // 3. Update version metadata configuration
         $verContent = "<?php\nif (!defined('APP_VERSION')) define('APP_VERSION', " . var_export($targetVer, true) . ");\nif (!defined('APP_BUILD_DATE')) define('APP_BUILD_DATE', " . var_export(date('Y-m-d'), true) . ");\nif (!defined('APP_REPO')) define('APP_REPO', 'beingniloy/smslink');\nreturn ['version' => APP_VERSION, 'build_date' => APP_BUILD_DATE, 'repo' => APP_REPO];\n";
         @file_put_contents(__DIR__ . '/../config/version.php', $verContent);
 
-        logActivity('system_update', "Applied system update and executed DB migrations to version: {$targetVer}");
+        logActivity('system_update', "Applied system update from GitHub to version: {$targetVer} ({$filesUpdatedCount} files updated)");
         echo json_encode([
             'ok' => true,
-            'message' => "System and database schema updated to {$targetVer} successfully!",
-            'version' => $targetVer
+            'message' => $filesUpdatedCount > 0 
+                ? "Downloaded latest release from GitHub and updated {$filesUpdatedCount} file(s) & database to {$targetVer}!" 
+                : "System database schema & version metadata updated to {$targetVer}!",
+            'version' => $targetVer,
+            'files_updated' => $filesUpdatedCount
         ]);
         exit;
     }
@@ -1338,25 +1463,67 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;color:#0f17
     <form id="loginForm">
       <div class="app-form-group">
         <label class="app-label">Username</label>
-        <input type="text" name="username" class="app-input" placeholder="admin" required autofocus>
+        <input type="text" name="username" id="loginUsername" class="app-input" placeholder="admin" required autofocus>
       </div>
-      <div class="app-form-group" style="margin-bottom:24px">
+      <div class="app-form-group" style="margin-bottom:14px">
         <label class="app-label">Password</label>
-        <input type="password" name="password" class="app-input" placeholder="••••••••" required>
+        <input type="password" name="password" id="loginPassword" class="app-input" placeholder="••••••••" required>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;font-size:12.5px">
+        <label style="display:inline-flex;align-items:center;gap:6px;color:#475569;cursor:pointer;user-select:none">
+          <input type="checkbox" id="rememberMeCheckbox" style="accent-color:var(--primary);cursor:pointer" checked>
+          <span>Remember username on this browser</span>
+        </label>
       </div>
       <button type="submit" class="app-btn app-btn-primary" style="width:100%;padding:12px">Sign in</button>
     </form>
   </div>
 </div>
 <script>
-document.getElementById('loginForm').addEventListener('submit', function(e){
+document.addEventListener('DOMContentLoaded', function(){
+  try {
+    const savedUser = localStorage.getItem('smslink_saved_username');
+    if (savedUser) {
+      const userIn = document.getElementById('loginUsername');
+      if (userIn) {
+        userIn.value = savedUser;
+        const pwdIn = document.getElementById('loginPassword');
+        if (pwdIn) pwdIn.focus();
+      }
+    }
+  } catch(e) {}
+});
+
+document.getElementById('loginForm')?.addEventListener('submit', function(e){
   e.preventDefault();
   const err = document.getElementById('loginError');
   const fd = new FormData(this);
+  const username = document.getElementById('loginUsername')?.value.trim();
+  const remember = document.getElementById('rememberMeCheckbox')?.checked;
+  const btn = this.querySelector('button[type="submit"]');
+
+  if (btn) setButtonLoading(btn, true, 'Signing in...');
+
   fetch('?login=1', {method:'POST', body:fd}).then(r=>r.json()).then(d=>{
-    if(d.ok) location.reload();
-    else { err.textContent = d.error || 'Invalid credentials'; err.style.display = 'block'; }
-  }).catch(()=>{ err.textContent = 'Network error'; err.style.display = 'block'; });
+    if(d.ok) {
+      try {
+        if (remember && username) {
+          localStorage.setItem('smslink_saved_username', username);
+        } else {
+          localStorage.removeItem('smslink_saved_username');
+        }
+      } catch(e) {}
+      location.reload();
+    } else {
+      if (btn) setButtonLoading(btn, false);
+      err.textContent = d.error || 'Invalid credentials';
+      err.style.display = 'block';
+    }
+  }).catch(()=>{
+    if (btn) setButtonLoading(btn, false);
+    err.textContent = 'Network error during sign in';
+    err.style.display = 'block';
+  });
 });
 </script>
 <?php else: ?>
@@ -1550,7 +1717,7 @@ document.getElementById('loginForm').addEventListener('submit', function(e){
           </div>
 
           <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
-            <button class="app-btn app-btn-primary" onclick="doSend()">Send SMS Now (Instant)</button>
+            <button class="app-btn app-btn-primary" id="btnSendSms" onclick="doSend()">Send SMS Now</button>
             <span id="sendStatus" style="font-size:13px;font-weight:600"></span>
           </div>
         </div>
@@ -3304,7 +3471,10 @@ document.addEventListener('DOMContentLoaded', function(){
     });
   }
   loadCountryCodeCache();
+  restoreSendDraft();
   syncDevicesState();
+  const devSelect = document.getElementById('sendDevice');
+  if (devSelect) devSelect.addEventListener('change', saveSendDraft);
 });
 
 function filterSentMessages(){
@@ -3587,6 +3757,7 @@ function updateSmsCharCount() {
   if (warningEl) {
     warningEl.style.display = len >= 160 ? 'inline' : 'none';
   }
+  saveSendDraft();
 }
 
 function validateSinglePhoneNumber(rawNumber, countryCode) {
@@ -3664,6 +3835,133 @@ function validateSinglePhoneNumber(rawNumber, countryCode) {
   return { valid: false, empty: true, message: 'Enter phone number' };
 }
 
+function selectSimRadio(slot, el) {
+  const hidden = document.getElementById('sendSimSlot');
+  if (hidden) hidden.value = slot;
+  document.querySelectorAll('.sim-radio-card').forEach(card => card.classList.remove('active'));
+  if (el) {
+    el.classList.add('active');
+    const radio = el.querySelector('input[type="radio"]');
+    if (radio) radio.checked = true;
+  }
+  saveSendDraft();
+}
+
+function getSelectedSimSlot() {
+  const input = document.getElementById('sendSimSlot');
+  return input ? parseInt(input.value) || 0 : 0;
+}
+
+function toggleCountryPicker(e) {
+  if (e) e.stopPropagation();
+  const dropdown = document.getElementById('countryPickerDropdown');
+  if (!dropdown) return;
+  const isVisible = dropdown.style.display === 'block';
+  dropdown.style.display = isVisible ? 'none' : 'block';
+  if (!isVisible) {
+    renderCountryOptions();
+    const searchBox = document.getElementById('countrySearchBox');
+    if (searchBox) { searchBox.value = ''; searchBox.focus(); }
+  }
+}
+
+function closeCountryPicker() {
+  const dropdown = document.getElementById('countryPickerDropdown');
+  if (dropdown) dropdown.style.display = 'none';
+}
+
+document.addEventListener('click', function(e) {
+  const wrap = document.getElementById('googlePhoneWrap');
+  if (wrap && !wrap.contains(e.target)) {
+    closeCountryPicker();
+  }
+});
+
+function saveCountryCodeCache(code, iso) {
+  try {
+    localStorage.setItem('smslink_country_code', code);
+    if (iso) localStorage.setItem('smslink_country_iso', iso);
+  } catch (e) {}
+}
+
+function loadCountryCodeCache() {
+  try {
+    const code = localStorage.getItem('smslink_country_code');
+    const iso = localStorage.getItem('smslink_country_iso');
+    if (code) {
+      const hidden = document.getElementById('countryCodeSelect');
+      if (hidden) hidden.value = code;
+      const dialSpan = document.getElementById('selectedDialCode');
+      if (dialSpan) dialSpan.textContent = code || 'Raw';
+    }
+    if (iso) {
+      const flagImg = document.getElementById('selectedFlagImg');
+      if (flagImg) {
+        if (iso !== 'none') {
+          flagImg.style.display = 'inline-block';
+          flagImg.src = `https://flagcdn.com/w40/${iso}.png`;
+        } else {
+          flagImg.style.display = 'none';
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+function saveSendDraft() {
+  try {
+    const numbers = document.getElementById('sendNumbers')?.value || '';
+    const message = document.getElementById('sendMessage')?.value || '';
+    const device = document.getElementById('sendDevice')?.value || 'auto';
+    const simSlot = getSelectedSimSlot();
+    const countryCode = document.getElementById('countryCodeSelect')?.value || '+880';
+    const isBulk = document.getElementById('bulkModeToggle')?.checked || false;
+
+    if (numbers.trim() || message.trim()) {
+      const draft = { numbers, message, device, simSlot, countryCode, isBulk, time: Date.now() };
+      localStorage.setItem('smslink_send_draft', JSON.stringify(draft));
+    } else {
+      localStorage.removeItem('smslink_send_draft');
+    }
+  } catch (e) {}
+}
+
+function restoreSendDraft() {
+  try {
+    const raw = localStorage.getItem('smslink_send_draft');
+    if (!raw) return;
+    const draft = JSON.parse(raw);
+    if (draft && typeof draft === 'object') {
+      const numInput = document.getElementById('sendNumbers');
+      const msgInput = document.getElementById('sendMessage');
+      const devSelect = document.getElementById('sendDevice');
+      const bulkToggle = document.getElementById('bulkModeToggle');
+
+      if (numInput && draft.numbers !== undefined) numInput.value = draft.numbers;
+      if (msgInput && draft.message !== undefined) msgInput.value = draft.message;
+      if (devSelect && draft.device) devSelect.value = draft.device;
+      if (bulkToggle && draft.isBulk !== undefined) {
+        bulkToggle.checked = draft.isBulk;
+        toggleBulkMode(draft.isBulk);
+      }
+      if (draft.simSlot !== undefined) {
+        const cards = document.querySelectorAll('.sim-radio-card');
+        if (cards[draft.simSlot]) {
+          selectSimRadio(draft.simSlot, cards[draft.simSlot]);
+        }
+      }
+      updateSmsCharCount();
+      onPhoneInputChanged();
+    }
+  } catch (e) {}
+}
+
+function clearSendDraft() {
+  try {
+    localStorage.removeItem('smslink_send_draft');
+  } catch (e) {}
+}
+
 function onPhoneInputChanged() {
   const isBulk = document.getElementById('bulkModeToggle')?.checked;
   const inputVal = document.getElementById('sendNumbers')?.value.trim() || '';
@@ -3698,6 +3996,7 @@ function onPhoneInputChanged() {
       statusEl.innerHTML = escapeHtml(res.message);
     }
   }
+  saveSendDraft();
 }
 
 function selectCountryOption(code, iso) {
@@ -3773,6 +4072,7 @@ async function doSend(){
       showToast(`SMS queued successfully for ${d.count || 1} recipient(s)!`, 'success');
       document.getElementById('sendNumbers').value = '';
       document.getElementById('sendMessage').value = '';
+      clearSendDraft();
       updateSmsCharCount();
       onPhoneInputChanged();
       refreshSentMessagesList();
