@@ -491,18 +491,27 @@ if (isset($_GET['action'])) {
     }
 
     if ($action === 'generate_pairing_qr') {
-        $pairingCode = 'PAIR_' . strtoupper(bin2hex(random_bytes(4)));
-        $token = 'dev_tok_' . bin2hex(random_bytes(12));
-        $sysSettings = getSystemSettings($pdo);
-        $currentUrl = !empty($sysSettings['app_url']) ? $sysSettings['app_url'] : getAutoDetectedBaseUrl();
+        try {
+            if (function_exists('random_bytes')) {
+                $pairingCode = 'PAIR_' . strtoupper(bin2hex(random_bytes(4)));
+                $token = 'dev_tok_' . bin2hex(random_bytes(12));
+            } else {
+                $pairingCode = 'PAIR_' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 8));
+                $token = 'dev_tok_' . md5(uniqid(mt_rand(), true));
+            }
+            $sysSettings = getSystemSettings($pdo);
+            $currentUrl = !empty($sysSettings['app_url']) ? $sysSettings['app_url'] : getAutoDetectedBaseUrl();
 
-        $qrData = json_encode([
-            'server_url' => $currentUrl,
-            'pairing_code' => $pairingCode,
-            'token' => $token
-        ]);
+            $qrData = json_encode([
+                'server_url' => $currentUrl,
+                'pairing_code' => $pairingCode,
+                'token' => $token
+            ]);
 
-        echo json_encode(['ok' => true, 'qr_data' => $qrData, 'pairing_code' => $pairingCode, 'token' => $token]);
+            echo json_encode(['ok' => true, 'qr_data' => $qrData, 'pairing_code' => $pairingCode, 'token' => $token]);
+        } catch (Throwable $e) {
+            echo json_encode(['ok' => false, 'error' => 'Failed to generate QR: ' . $e->getMessage()]);
+        }
         exit;
     }
 
@@ -3698,16 +3707,24 @@ async function openQrModal(){
       `;
 
       const qrCanvasWrap = document.getElementById('qrCanvasWrap');
+      let qrRendered = false;
       if (window.QRCode && qrCanvasWrap) {
-        new QRCode(qrCanvasWrap, {
-          text: d.qr_data,
-          width: 190,
-          height: 190,
-          colorDark: "#0f172a",
-          colorLight: "#ffffff",
-          correctLevel: QRCode.CorrectLevel.M
-        });
-      } else if (qrCanvasWrap) {
+        try {
+          qrCanvasWrap.innerHTML = '';
+          new QRCode(qrCanvasWrap, {
+            text: d.qr_data,
+            width: 190,
+            height: 190,
+            colorDark: "#0f172a",
+            colorLight: "#ffffff",
+            correctLevel: QRCode.CorrectLevel.M
+          });
+          qrRendered = true;
+        } catch (qrErr) {
+          console.warn('Local QRCode rendering failed, attempting image fallback:', qrErr);
+        }
+      }
+      if (!qrRendered && qrCanvasWrap) {
         const qrData = encodeURIComponent(d.qr_data);
         const primaryQr = `https://quickchart.io/qr?size=200&text=${qrData}`;
         const fallbackQr = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${qrData}`;
@@ -3756,11 +3773,14 @@ async function openQrModal(){
       }, 1500);
 
     } else {
-      container.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Failed to generate QR code</div>';
+      const errMsg = (d && d.error) ? d.error : 'Failed to generate QR code';
+      container.innerHTML = `<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">${escapeHtml(errMsg)}</div>`;
     }
   } catch(e) {
+    console.error('QR Generation Error:', e);
     if (e.message !== 'Unauthenticated') {
-      container.innerHTML = '<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">Network error generating QR code</div>';
+      const errMsg = e.message ? `Network error: ${e.message}` : 'Network error generating QR code';
+      container.innerHTML = `<div style="color:#dc2626;font-size:13px;padding:20px;text-align:center">${escapeHtml(errMsg)}</div>`;
     }
   }
 }
