@@ -1,6 +1,6 @@
 # SMSLink - Turn any Android phone into your SMS gateway
 
-[![Version](https://img.shields.io/badge/version-v1.0.0-057d77.svg?style=flat-square)](https://github.com/beingniloy/smslink/releases)
+[![Version](https://img.shields.io/badge/version-v1.0.9-057d77.svg?style=flat-square)](https://github.com/beingniloy/smslink/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![PHP](https://img.shields.io/badge/PHP-7.4%20%7C%208.0%20%7C%208.1%20%7C%208.2%20%7C%208.3-blue.svg?style=flat-square)](https://php.net)
 [![Database](https://img.shields.io/badge/Database-MySQL%205.7%2B%20%7C%20MariaDB-orange.svg?style=flat-square)](https://mysql.com)
